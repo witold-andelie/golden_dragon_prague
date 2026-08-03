@@ -58,6 +58,13 @@ def get_connection():
     """Create database connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
+        # Read-only reporting workload. Autocommit keeps each statement in its own
+        # transaction, so one failing query cannot leave the connection in an
+        # aborted state that makes every later query fail with
+        # "current transaction is aborted, commands ignored until end of
+        # transaction block" - which made a single broken view look like a
+        # totally broken database.
+        conn.autocommit = True
         return conn
     except psycopg2.Error as e:
         print(f"Error connecting to database: {e}")
@@ -317,6 +324,10 @@ def main():
     print("=" * 60)
     print()
 
+    # Ensure output directory exists before we try to write the report into it.
+    # samples/dashboard_output/ is gitignored, so it does not exist in a fresh clone.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     conn = get_connection()
     print(f"Connected to database: {DB_CONFIG['dbname']}")
     print()
@@ -334,6 +345,7 @@ def main():
         print("  [OK] Revenue trend chart")
     except Exception as e:
         print(f"  [FAIL] Revenue chart: {e}")
+        conn.rollback()
 
     # 2. Customer segments
     try:
@@ -342,6 +354,7 @@ def main():
         print("  [OK] Customer segment chart")
     except Exception as e:
         print(f"  [FAIL] Customer segment chart: {e}")
+        conn.rollback()
 
     # 3. Source performance
     try:
@@ -350,6 +363,7 @@ def main():
         print("  [OK] Source performance chart")
     except Exception as e:
         print(f"  [FAIL] Source chart: {e}")
+        conn.rollback()
 
     # 4. Top dishes
     try:
@@ -358,6 +372,7 @@ def main():
         print("  [OK] Top dishes chart")
     except Exception as e:
         print(f"  [FAIL] Top dishes chart: {e}")
+        conn.rollback()
 
     # 5. Hourly heatmap
     try:
@@ -366,6 +381,7 @@ def main():
         print("  [OK] Hourly heatmap chart")
     except Exception as e:
         print(f"  [FAIL] Hourly heatmap: {e}")
+        conn.rollback()
 
     print()
 
@@ -397,6 +413,7 @@ def main():
         print("  [OK] Statistics collected")
     except Exception as e:
         print(f"  [FAIL] Stats: {e}")
+        conn.rollback()
     finally:
         cursor.close()
 

@@ -50,11 +50,24 @@ COMMENT ON FUNCTION trg_check_inventory() IS 'BEFORE INSERT trigger function: ch
 CREATE OR REPLACE FUNCTION trg_set_unit_price()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_price NUMERIC;
+    v_order_time TIMESTAMP;
 BEGIN
-    -- Apply dynamic pricing based on current time
-    v_price := get_effective_price(NEW.menu_id, NOW());
-    NEW.unit_price := v_price;
+    -- An explicitly supplied price wins (manual adjustment, back-dated import).
+    IF NEW.unit_price IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Price against the ORDER's timestamp, not wall-clock NOW(). Back-filled or
+    -- historical rows would otherwise be priced at whatever window the import
+    -- happens to run in, which is how lunch/regular prices get mixed up.
+    SELECT o.order_time INTO v_order_time
+    FROM Orders o
+    WHERE o.order_id = NEW.order_id;
+
+    -- LOCALTIMESTAMP, not NOW(): NOW() is timestamptz and get_effective_price()
+    -- takes timestamp. timestamptz -> timestamp is only an assignment cast, so
+    -- passing NOW() fails function resolution at runtime.
+    NEW.unit_price := get_effective_price(NEW.menu_id, COALESCE(v_order_time, LOCALTIMESTAMP));
 
     RETURN NEW;
 END;
@@ -66,7 +79,7 @@ FOR EACH ROW
 EXECUTE FUNCTION trg_set_unit_price();
 
 COMMENT ON TRIGGER trg_set_price_before ON OrderDetails IS 'Automatically sets unit_price using dynamic pricing (lunch vs regular). Ensures price consistency at order time.';
-COMMENT ON FUNCTION trg_set_unit_price() IS 'BEFORE INSERT: applies get_effective_price() to capture correct price at order moment.';
+COMMENT ON FUNCTION trg_set_unit_price() IS 'BEFORE INSERT: applies get_effective_price() at the parent order''s order_time to capture the correct price. Leaves an explicitly supplied unit_price untouched.';
 
 -- ============================================================
 -- TRIGGER 3: Inventory Deduction + Order Total Recalculation (AFTER INSERT)
@@ -145,7 +158,20 @@ COMMENT ON FUNCTION trg_order_status_change() IS 'AFTER UPDATE trigger: prevents
 CREATE OR REPLACE FUNCTION trg_reservation_conflict()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NOT is_table_available(NEW.table_id, NEW.reservation_time) THEN
+    -- Only bookings that actually hold the table need checking. Cancelling or
+    -- closing out a reservation must never be blocked by a conflict check.
+    IF NEW.status NOT IN ('pending', 'confirmed') THEN
+        RETURN NEW;
+    END IF;
+
+    -- On UPDATE the row being saved is still visible to the SELECT inside
+    -- is_table_available(), so it would conflict with itself. Exclude it.
+    IF NOT is_table_available(
+           NEW.table_id,
+           NEW.reservation_time,
+           120,
+           CASE WHEN TG_OP = 'UPDATE' THEN OLD.reservation_id ELSE NULL END
+       ) THEN
         RAISE EXCEPTION 'Reservation conflict: Table % is unavailable at %.',
             NEW.table_id, NEW.reservation_time;
     END IF;

@@ -116,7 +116,9 @@ COMMENT ON TABLE dim_employee IS 'Employee dimension for staff performance analy
 CREATE TABLE IF NOT EXISTS fact_orders (
     fact_id           SERIAL PRIMARY KEY,
     date_key           DATE NOT NULL REFERENCES dim_date(date_key),
-    customer_key       INT NOT NULL REFERENCES dim_customer(customer_key),
+    -- Nullable: walk-in / phone orders legitimately have no user_id. Making this
+    -- NOT NULL plus an inner join in the ETL silently dropped those orders.
+    customer_key       INT REFERENCES dim_customer(customer_key),
     menu_key           INT NOT NULL REFERENCES dim_menu_item(menu_key),
     channel_key        INT NOT NULL REFERENCES dim_channel(channel_key),
     employee_key       INT REFERENCES dim_employee(employee_key),
@@ -124,11 +126,15 @@ CREATE TABLE IF NOT EXISTS fact_orders (
     order_detail_id    INT NOT NULL,
     quantity           INT NOT NULL,
     unit_price         NUMERIC(8,2) NOT NULL,
-    line_total         NUMERIC(10,2) NOT NULL,
+    -- ---- Additive measures at the line grain --------------------------------
+    line_total           NUMERIC(10,2) NOT NULL,
+    line_vat_amount      NUMERIC(10,2),
+    line_delivery_fee    NUMERIC(10,2) DEFAULT 0,
+    line_discount_amount NUMERIC(10,2) DEFAULT 0,
+    -- ---- Order-grain reference value: NOT additive --------------------------
+    -- Repeated on every line of the order. Never SUM() this; use the allocated
+    -- line_* measures, or COUNT(DISTINCT order_id) as a denominator.
     order_total        NUMERIC(10,2),
-    vat_amount         NUMERIC(10,2),
-    delivery_fee       NUMERIC(8,2) DEFAULT 0,
-    discount_amount    NUMERIC(8,2) DEFAULT 0,
     order_type         VARCHAR(20),
     order_status       VARCHAR(25),
     order_hour         INT,
@@ -137,7 +143,21 @@ CREATE TABLE IF NOT EXISTS fact_orders (
     loaded_at          TIMESTAMP DEFAULT NOW()
 );
 
-COMMENT ON TABLE fact_orders IS 'Order line item fact table. Grain: one row per menu item per order. Supports OLAP queries and BI dashboards.';
+COMMENT ON TABLE fact_orders IS 'Order line item fact table. Grain: one row per menu item per order. Order-level money (VAT, delivery fee, discount) is allocated to lines pro-rata by line share of subtotal, so every line_* measure is additive at any grain.';
+COMMENT ON COLUMN fact_orders.order_total IS 'Order-grain total, repeated per line. NOT additive - do not SUM.';
+COMMENT ON COLUMN fact_orders.line_vat_amount IS 'Order VAT allocated to this line pro-rata by line share of order subtotal. Additive.';
+COMMENT ON COLUMN fact_orders.line_delivery_fee IS 'Order delivery fee allocated to this line pro-rata. Additive.';
+COMMENT ON COLUMN fact_orders.line_discount_amount IS 'Order discount allocated to this line pro-rata. Additive.';
+
+-- Natural-key uniqueness on the "current" slice of each dimension.
+-- Without these, re-running this file inserts a second copy of every dimension
+-- row and the fact load fans out against the duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dim_customer_current
+    ON dim_customer(user_id) WHERE is_current;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dim_menu_item_current
+    ON dim_menu_item(menu_id) WHERE is_current;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dim_employee_current
+    ON dim_employee(employee_id) WHERE is_current;
 
 -- Indexes on fact table for OLAP queries
 CREATE INDEX IF NOT EXISTS idx_fact_date ON fact_orders(date_key);
@@ -197,9 +217,10 @@ SELECT
     TO_CHAR(d, 'FMDay'),
     TO_CHAR(d, 'FMMonth'),
     EXTRACT(ISODOW FROM d) IN (6, 7),
-    EXTRACT(ISODOW FROM d) BETWEEN 1 AND 5
-        AND EXTRACT(HOUR FROM TIME '11:00') >= 11
-        AND EXTRACT(HOUR FROM TIME '14:30') <= 14,
+    -- dim_date is day-grain, so this can only mean "is the lunch special offered
+    -- on this DAY" (Mon-Fri). The old version ANDed two constant-true comparisons
+    -- on literal times, which was dead code. Time-of-day is on fact_orders.
+    EXTRACT(ISODOW FROM d) BETWEEN 1 AND 5,
     CASE WHEN EXTRACT(MONTH FROM d) >= 4 THEN EXTRACT(YEAR FROM d)::INT ELSE EXTRACT(YEAR FROM d)::INT - 1 END,
     CASE
         WHEN EXTRACT(MONTH FROM d) IN (4,5,6) THEN 1
@@ -207,7 +228,8 @@ SELECT
         WHEN EXTRACT(MONTH FROM d) IN (10,11,12) THEN 3
         ELSE 4
     END
-FROM generate_series('2024-01-01'::DATE, '2026-12-31'::DATE, '1 day'::INTERVAL) d;
+FROM generate_series('2024-01-01'::DATE, '2026-12-31'::DATE, '1 day'::INTERVAL) d
+ON CONFLICT (date_key) DO NOTHING;
 
 -- Populate dim_customer (current state)
 INSERT INTO dim_customer (user_id, username, full_name, email, phone, role, loyalty_tier, valid_from)
@@ -226,7 +248,10 @@ SELECT
     END,
     CURRENT_DATE
 FROM Users
-WHERE role = 'customer';
+-- 'vip' is a loyalty tier of the customer base, not a separate audience.
+-- Excluding it dropped the highest-value customers from the whole warehouse.
+WHERE role IN ('customer', 'vip')
+ON CONFLICT (user_id) WHERE is_current DO NOTHING;
 
 -- Populate dim_menu_item (current state)
 INSERT INTO dim_menu_item (menu_id, name_en, name_cz, category_name_en, category_name_cz, price_regular, price_lunch, spice_level, estimated_prep, allergen_count)
@@ -244,7 +269,8 @@ SELECT
 FROM Menus m
 JOIN MenuCategories c ON m.category_id = c.category_id
 LEFT JOIN MenuAllergens ma ON m.menu_id = ma.menu_id
-GROUP BY m.menu_id, m.name_en, m.name_cz, c.name_en, c.name_cz, m.price_regular, m.price_lunch, m.spice_level, m.estimated_prep_minutes;
+GROUP BY m.menu_id, m.name_en, m.name_cz, c.name_en, c.name_cz, m.price_regular, m.price_lunch, m.spice_level, m.estimated_prep_minutes
+ON CONFLICT (menu_id) WHERE is_current DO NOTHING;
 
 -- Populate dim_channel
 INSERT INTO dim_channel (source, channel_type, platform_fee_pct, description)
@@ -260,7 +286,8 @@ ON CONFLICT (source) DO NOTHING;
 -- Populate dim_employee
 INSERT INTO dim_employee (employee_id, full_name, role, hire_date, is_active)
 SELECT employee_id, full_name, role, hire_date, is_active
-FROM Employees;
+FROM Employees
+ON CONFLICT (employee_id) WHERE is_current DO NOTHING;
 
 -- ============================================================
 -- ETL STORED PROCEDURES
@@ -275,37 +302,44 @@ LANGUAGE plpgsql AS $$
 DECLARE
     v_etl_id INT;
     v_rows_loaded INT := 0;
+    v_rows_expected INT := 0;
 BEGIN
     -- Log ETL start
     INSERT INTO etl_control (etl_name, status)
     VALUES ('load_fact_orders', 'running')
     RETURNING etl_id INTO v_etl_id;
 
-    -- Clear today's load (idempotent)
-    DELETE FROM fact_orders WHERE loaded_at >= CURRENT_DATE;
+    -- Full reload. The extract below has no date predicate, so it always
+    -- re-reads every order; deleting only rows whose loaded_at >= CURRENT_DATE
+    -- left yesterday's rows in place and duplicated the entire history on the
+    -- second run of the day.
+    DELETE FROM fact_orders;
 
     -- Extract + Transform + Load
     INSERT INTO fact_orders (
         date_key, customer_key, menu_key, channel_key, employee_key,
         order_id, order_detail_id, quantity, unit_price, line_total,
-        order_total, vat_amount, delivery_fee, discount_amount,
-        order_type, order_status, order_hour, order_dow, is_lunch_order
+        line_vat_amount, line_delivery_fee, line_discount_amount,
+        order_total, order_type, order_status, order_hour, order_dow, is_lunch_order
     )
     SELECT
         DATE(o.order_time),
         dc.customer_key,
         dm.menu_key,
         dch.channel_key,
-        COALESCE(de.employee_key, 0),
+        de.employee_key,
         od.order_id,
         od.order_detail_id,
         od.quantity,
         od.unit_price,
         od.quantity * od.unit_price,
+        -- Order-level money allocated pro-rata to this line. The weights across
+        -- an order sum to 1, so SUM(line_vat_amount) reproduces the order VAT
+        -- exactly instead of multiplying it by the number of line items.
+        ROUND(o.vat_amount      * alloc.w, 2),
+        ROUND(COALESCE(o.delivery_fee, 0)    * alloc.w, 2),
+        ROUND(COALESCE(o.discount_amount, 0) * alloc.w, 2),
         o.total,
-        o.vat_amount,
-        o.delivery_fee,
-        o.discount_amount,
         o.order_type,
         o.status,
         EXTRACT(HOUR FROM o.order_time)::INT,
@@ -317,12 +351,37 @@ BEGIN
         END
     FROM OrderDetails od
     JOIN Orders o ON od.order_id = o.order_id
-    JOIN dim_customer dc ON o.user_id = dc.user_id AND dc.is_current
+    -- LEFT JOIN: walk-in orders have no user_id and must not be dropped.
+    LEFT JOIN dim_customer dc ON o.user_id = dc.user_id AND dc.is_current
     JOIN dim_menu_item dm ON od.menu_id = dm.menu_id AND dm.is_current
     JOIN dim_channel dch ON o.source = dch.source
-    LEFT JOIN dim_employee de ON o.employee_id = de.employee_id AND de.is_current;
+    LEFT JOIN dim_employee de ON o.employee_id = de.employee_id AND de.is_current
+    LEFT JOIN LATERAL (
+        SELECT COALESCE((od.quantity * od.unit_price) / NULLIF(o.subtotal, 0), 0) AS w
+    ) alloc ON TRUE;
 
     GET DIAGNOSTICS v_rows_loaded = ROW_COUNT;
+
+    -- Guard against silent row loss: the inner joins above (menu, channel) can
+    -- still drop lines if a dimension is incomplete. Record it rather than
+    -- letting the fact table quietly disagree with the source.
+    SELECT COUNT(*) INTO v_rows_expected FROM OrderDetails;
+
+    INSERT INTO data_quality_audit (
+        check_name, table_name, expected_count, actual_count, discrepancy, status, notes
+    )
+    VALUES (
+        'fact_orders_row_completeness',
+        'fact_orders',
+        v_rows_expected,
+        v_rows_loaded,
+        v_rows_expected - v_rows_loaded,
+        CASE WHEN v_rows_expected = v_rows_loaded THEN 'PASS' ELSE 'FAIL' END,
+        CASE WHEN v_rows_expected = v_rows_loaded
+             THEN 'All order lines loaded'
+             ELSE (v_rows_expected - v_rows_loaded) || ' order lines dropped by dimension joins'
+        END
+    );
 
     -- Update ETL log
     UPDATE etl_control
@@ -335,7 +394,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON PROCEDURE sp_load_fact_orders() IS 'ETL procedure: loads operational order data into star schema fact table. Idempotent - clears current day load first.';
+COMMENT ON PROCEDURE sp_load_fact_orders() IS 'ETL procedure: loads operational order data into star schema fact table. Idempotent - full reload (truncate-and-load), so re-running never duplicates rows.';
 
 -- ============================================================
 -- PROCEDURE 2: sp_run_data_quality_checks
@@ -455,7 +514,7 @@ SELECT
     dd.year,
     dd.month,
     dd.day_name,
-    dc.full_name AS customer,
+    COALESCE(dc.full_name, 'Walk-in / Unknown') AS customer,
     dm.name_en AS dish,
     dch.source AS channel,
     de.full_name AS staff,
@@ -464,7 +523,9 @@ SELECT
     COUNT(DISTINCT fo.order_id) AS orders
 FROM fact_orders fo
 JOIN dim_date dd ON fo.date_key = dd.date_key
-JOIN dim_customer dc ON fo.customer_key = dc.customer_key
+-- LEFT JOIN + COALESCE: customer_key is NULL for walk-in orders. An inner join
+-- here would hide them from the analysis entirely.
+LEFT JOIN dim_customer dc ON fo.customer_key = dc.customer_key
 JOIN dim_menu_item dm ON fo.menu_key = dm.menu_key
 JOIN dim_channel dch ON fo.channel_key = dch.channel_key
 LEFT JOIN dim_employee de ON fo.employee_key = de.employee_key
@@ -495,24 +556,43 @@ ORDER BY user_id, valid_from;
 -- MATERIALIZED VIEW: mv_daily_kpi
 -- Pre-computed daily KPIs for fast dashboard queries
 -- ============================================================
+-- Revenue measures are restricted to completed orders (cancelled and in-flight
+-- orders are not realised revenue) and use the allocated line_* measures, which
+-- are additive at the line grain. The previous version summed order-grain
+-- vat_amount and averaged order-grain order_total across line items, inflating
+-- both by the number of lines per order.
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_kpi AS
 SELECT
     dd.date_key,
     dd.day_name,
-    COUNT(DISTINCT fo.order_id) AS total_orders,
-    COUNT(DISTINCT fo.customer_key) AS unique_customers,
-    SUM(fo.line_total) AS gross_revenue,
-    SUM(fo.vat_amount) AS vat_collected,
-    AVG(fo.order_total) AS avg_order_value,
-    SUM(CASE WHEN fo.order_type = 'dine_in' THEN fo.line_total ELSE 0 END) AS dine_in,
-    SUM(CASE WHEN fo.order_type = 'delivery' THEN fo.line_total ELSE 0 END) AS delivery,
-    SUM(CASE WHEN fo.order_type = 'event' THEN fo.line_total ELSE 0 END) AS event
+    COUNT(DISTINCT fo.order_id)                                              AS total_orders,
+    COUNT(DISTINCT fo.order_id) FILTER (WHERE fo.order_status = 'completed') AS completed_orders,
+    COUNT(DISTINCT fo.customer_key)                                          AS unique_customers,
+    -- Net of VAT
+    SUM(fo.line_total) FILTER (WHERE fo.order_status = 'completed')          AS net_revenue,
+    SUM(fo.line_vat_amount) FILTER (WHERE fo.order_status = 'completed')     AS vat_collected,
+    -- What the customer actually paid: net + VAT + delivery - discount
+    SUM(fo.line_total + COALESCE(fo.line_vat_amount, 0)
+        + COALESCE(fo.line_delivery_fee, 0)
+        - COALESCE(fo.line_discount_amount, 0))
+        FILTER (WHERE fo.order_status = 'completed')                         AS gross_revenue,
+    ROUND(
+        SUM(fo.line_total + COALESCE(fo.line_vat_amount, 0)
+            + COALESCE(fo.line_delivery_fee, 0)
+            - COALESCE(fo.line_discount_amount, 0))
+            FILTER (WHERE fo.order_status = 'completed')
+        / NULLIF(COUNT(DISTINCT fo.order_id) FILTER (WHERE fo.order_status = 'completed'), 0),
+        2
+    )                                                                        AS avg_order_value,
+    SUM(fo.line_total) FILTER (WHERE fo.order_status = 'completed' AND fo.order_type = 'dine_in')  AS dine_in,
+    SUM(fo.line_total) FILTER (WHERE fo.order_status = 'completed' AND fo.order_type = 'delivery') AS delivery,
+    SUM(fo.line_total) FILTER (WHERE fo.order_status = 'completed' AND fo.order_type = 'event')    AS event
 FROM fact_orders fo
 JOIN dim_date dd ON fo.date_key = dd.date_key
 GROUP BY dd.date_key, dd.day_name
 ORDER BY dd.date_key;
 
-COMMENT ON MATERIALIZED VIEW mv_daily_kpi IS 'Pre-computed daily KPIs for fast dashboard queries. Refresh via REFRESH MATERIALIZED VIEW mv_daily_kpi;';
+COMMENT ON MATERIALIZED VIEW mv_daily_kpi IS 'Pre-computed daily KPIs for fast dashboard queries. Revenue measures cover completed orders only and use the pro-rata allocated line_* measures. Refresh via REFRESH MATERIALIZED VIEW mv_daily_kpi;';
 
 -- Index on materialized view for fast filtering
 CREATE INDEX IF NOT EXISTS idx_mv_daily_kpi_date ON mv_daily_kpi(date_key);

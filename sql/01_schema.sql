@@ -153,8 +153,11 @@ CREATE TABLE Reservations (
     table_id         INT REFERENCES RestaurantTables(table_id),
     reservation_time TIMESTAMP NOT NULL,
     party_size       SMALLINT NOT NULL,
+    -- Lifecycle: pending -> confirmed -> completed | cancelled | no_show.
+    -- 'completed' is a terminal state for a booking the guest actually honoured;
+    -- only pending/confirmed block the table in is_table_available().
     status           VARCHAR(20) DEFAULT 'confirmed'
-        CHECK (status IN ('pending','confirmed','cancelled','no_show')),
+        CHECK (status IN ('pending','confirmed','completed','cancelled','no_show')),
     notes            TEXT,
     created_at       TIMESTAMP DEFAULT NOW()
 );

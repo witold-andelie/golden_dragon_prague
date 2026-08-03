@@ -7,6 +7,10 @@
 -- Run: psql -U postgres -f sql/99_full_setup.sql
 -- ============================================================
 
+-- Abort immediately on the first error instead of continuing and printing
+-- "Setup Complete" over a half-built database.
+\set ON_ERROR_STOP on
+
 \echo '=== Golden Dragon Prague Chinese Restaurant | Full Setup (English Version) ==='
 \echo 'Database: golden_dragon_prague'
 \echo 'Business: Chinese restaurant in Prague, Czech Republic'

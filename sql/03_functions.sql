@@ -76,11 +76,19 @@ COMMENT ON FUNCTION get_effective_price(INT, TIMESTAMP) IS 'Dynamic pricing: ret
 -- Checks if a table is free for a reservation (with 2-hour buffer)
 --
 -- Business Rule: 2-hour default dining duration
+--
+-- p_exclude_reservation_id lets an UPDATE of an existing booking ignore its own
+-- row; without it a reservation always conflicts with itself.
 -- ============================================================
+-- Drop the old 3-argument signature so re-running this file on an existing
+-- database does not leave an ambiguous overload behind.
+DROP FUNCTION IF EXISTS is_table_available(INT, TIMESTAMP, INT);
+
 CREATE OR REPLACE FUNCTION is_table_available(
     p_table_id INT,
     p_time     TIMESTAMP,
-    p_duration_minutes INT DEFAULT 120
+    p_duration_minutes INT DEFAULT 120,
+    p_exclude_reservation_id INT DEFAULT NULL
 ) RETURNS BOOLEAN AS $$
 BEGIN
     -- Table is available if NO confirmed/pending reservation overlaps
@@ -90,13 +98,15 @@ BEGIN
         FROM Reservations r
         WHERE r.table_id = p_table_id
           AND r.status IN ('confirmed', 'pending')
+          AND (p_exclude_reservation_id IS NULL
+               OR r.reservation_id <> p_exclude_reservation_id)
           AND r.reservation_time < (p_time + (p_duration_minutes || ' minutes')::INTERVAL)
-          AND (r.reservation_time + '120 minutes'::INTERVAL) > p_time
+          AND (r.reservation_time + (p_duration_minutes || ' minutes')::INTERVAL) > p_time
     );
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION is_table_available(INT, TIMESTAMP, INT) IS 'Table availability check with 2-hour overlap buffer. Used by reservation system.';
+COMMENT ON FUNCTION is_table_available(INT, TIMESTAMP, INT, INT) IS 'Table availability check with 2-hour overlap buffer. Pass p_exclude_reservation_id when re-checking an existing booking. Used by reservation system.';
 
 -- ============================================================
 -- FUNCTION 4: create_reservation

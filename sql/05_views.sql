@@ -180,7 +180,7 @@ SELECT
     MIN(o.order_time)                                                  AS first_order_time
 FROM Users u
 LEFT JOIN Orders o ON u.user_id = o.user_id
-WHERE u.role = 'customer'
+WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
 GROUP BY u.user_id, u.username, u.full_name, u.email, u.phone, u.role, u.loyalty_points
 ORDER BY lifetime_value DESC NULLS LAST;
 
@@ -222,22 +222,35 @@ SELECT
     rt.table_number,
     e.event_date,
     e.location                               AS event_location,
-    COUNT(od.order_detail_id)                 AS item_count,
-    SUM(od.quantity)                          AS total_items,
-    CASE WHEN p.payment_id IS NOT NULL THEN 'PAID' ELSE 'UNPAID' END AS payment_status,
-    MAX(p.paid_at)                            AS paid_at
+    items.item_count,
+    items.total_items,
+    -- Aggregated in a LATERAL so a second payment row cannot double item_count,
+    -- and so a partial payment is not reported as fully PAID.
+    CASE
+        WHEN pay.payment_count = 0                            THEN 'UNPAID'
+        WHEN pay.paid_amount >= COALESCE(o.total, 0) - 0.01   THEN 'PAID'
+        ELSE 'PARTIAL'
+    END                                       AS payment_status,
+    pay.paid_amount,
+    pay.paid_at
 FROM Orders o
-JOIN Users u            ON o.user_id = u.user_id
+-- LEFT JOIN: walk-in / phone orders have no user_id and must still appear.
+LEFT JOIN Users u             ON o.user_id  = u.user_id
 LEFT JOIN RestaurantTables rt ON o.table_id = rt.table_id
-LEFT JOIN Events e      ON o.order_id = e.order_id
-LEFT JOIN OrderDetails od ON o.order_id = od.order_id
-LEFT JOIN Payments p    ON o.order_id = p.order_id
-GROUP BY
-    o.order_id, u.full_name, u.email, u.phone,
-    o.order_time, o.order_type, o.source, o.status,
-    o.special_requests, o.subtotal, o.vat_amount,
-    o.delivery_fee, o.total, o.delivery_address,
-    rt.table_number, e.event_date, e.location
+LEFT JOIN Events e            ON o.order_id = e.order_id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)                       AS item_count,
+           COALESCE(SUM(od.quantity), 0)  AS total_items
+    FROM OrderDetails od
+    WHERE od.order_id = o.order_id
+) items ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COUNT(*)                     AS payment_count,
+           COALESCE(SUM(p.amount), 0)   AS paid_amount,
+           MAX(p.paid_at)               AS paid_at
+    FROM Payments p
+    WHERE p.order_id = o.order_id
+) pay ON TRUE
 ORDER BY o.order_time DESC;
 
 COMMENT ON VIEW v_order_summary IS 'Comprehensive order view: customer, financials, items, payment status, event details. Single source of truth for order information.';

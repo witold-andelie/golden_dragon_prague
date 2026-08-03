@@ -50,7 +50,7 @@ WITH rfm_base AS (
         COALESCE(SUM(o.total), 0) AS monetary
     FROM Users u
     LEFT JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
-    WHERE u.role = 'customer'
+    WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
     GROUP BY u.user_id, u.full_name, u.email, u.loyalty_points
 ),
 rfm_scores AS (
@@ -348,7 +348,7 @@ WITH customer_stats AS (
         MODE() WITHIN GROUP (ORDER BY EXTRACT(DOW FROM o.order_time)) AS preferred_day
     FROM Users u
     LEFT JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
-    WHERE u.role = 'customer'
+    WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
     GROUP BY u.user_id, u.full_name, u.role
 )
 SELECT * FROM customer_stats
@@ -399,7 +399,9 @@ SELECT
     total_orders,
     lifetime_value,
     avg_order_value,
-    last_order,
+    -- v_customer_order_history exposes this as last_order_time (not last_order);
+    -- aliased back so downstream consumers keep the short name.
+    last_order_time AS last_order,
     loyalty_points,
     CASE
         WHEN lifetime_value > 1000 THEN 'Platinum'

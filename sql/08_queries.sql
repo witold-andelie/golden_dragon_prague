@@ -254,7 +254,7 @@ FROM (
         COUNT(o.order_id) AS order_frequency
     FROM Users u
     LEFT JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
-    WHERE u.role = 'customer'
+    WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
     GROUP BY u.user_id
 ) sub
 GROUP BY order_frequency
@@ -267,7 +267,7 @@ SELECT
     u.full_name,
     get_customer_lifetime_value(u.user_id) AS lifetime_value
 FROM Users u
-WHERE u.role = 'customer'
+WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
 ORDER BY lifetime_value DESC;
 
 -- ============================================================

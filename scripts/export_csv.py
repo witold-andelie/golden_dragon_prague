@@ -76,6 +76,10 @@ def get_connection():
     """Create database connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
+        # Read-only export workload. Autocommit keeps each statement in its own
+        # transaction, so one failing view cannot abort the transaction and make
+        # every subsequent export fail with "current transaction is aborted".
+        conn.autocommit = True
         return conn
     except psycopg2.Error as e:
         print(f"Error connecting to database: {e}")
@@ -101,6 +105,7 @@ def export_table(conn, table_name, output_file):
         return len(rows)
     except Exception as e:
         print(f"  [FAIL] {table_name}: {e}")
+        conn.rollback()
         return 0
     finally:
         cursor.close()
@@ -124,6 +129,7 @@ def export_view(conn, view_name, output_file):
         return len(rows)
     except Exception as e:
         print(f"  [FAIL] {view_name}: {e}")
+        conn.rollback()
         return 0
     finally:
         cursor.close()
@@ -168,6 +174,7 @@ def export_summary_stats(conn):
 
     except Exception as e:
         print(f"  [FAIL] Summary stats: {e}")
+        conn.rollback()
 
     # Write stats file
     filepath = os.path.join(OUTPUT_DIR, 'summary_stats.txt')

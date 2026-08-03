@@ -191,7 +191,7 @@ WITH customer_freq AS (
         SUM(o.total) AS lifetime_value
     FROM Users u
     LEFT JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
-    WHERE u.role = 'customer'
+    WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
     GROUP BY u.user_id, u.full_name
 )
 SELECT
@@ -402,6 +402,32 @@ GROUP BY customer_pct, cumulative_pct
 ORDER BY customer_pct;
 
 -- Find the exact 80/20 threshold
+-- NOTE: CTEs do not survive past the semicolon of the statement that declares
+-- them, so `ranked` has to be re-declared here rather than reused.
+WITH customer_revenue AS (
+    SELECT
+        u.user_id,
+        u.full_name,
+        SUM(o.total) AS revenue
+    FROM Users u
+    JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
+    GROUP BY u.user_id, u.full_name
+),
+ranked AS (
+    SELECT
+        *,
+        ROUND(
+            SUM(revenue) OVER (ORDER BY revenue DESC ROWS UNBOUNDED PRECEDING) /
+            SUM(revenue) OVER () * 100,
+            2
+        ) AS cumulative_pct,
+        ROUND(
+            ROW_NUMBER() OVER (ORDER BY revenue DESC)::NUMERIC /
+            COUNT(*) OVER () * 100,
+            2
+        ) AS customer_pct
+    FROM customer_revenue
+)
 SELECT
     full_name,
     revenue,
@@ -409,6 +435,7 @@ SELECT
     customer_pct
 FROM ranked
 WHERE cumulative_pct >= 78 AND cumulative_pct <= 82
+ORDER BY cumulative_pct
 LIMIT 5;
 
 -- ============================================================
@@ -482,23 +509,25 @@ ORDER BY total_spent DESC;
 -- QUERY 19: Index Performance Verification
 -- ============================================================
 -- Check which indexes are actually used
+-- pg_stat_user_indexes exposes relname/indexrelname, not tablename/indexname.
 SELECT
     schemaname,
-    tablename,
-    indexname,
+    relname      AS tablename,
+    indexrelname AS indexname,
     idx_scan AS times_used,
     idx_tup_read AS tuples_read,
     idx_tup_fetch AS tuples_fetched
 FROM pg_stat_user_indexes
-WHERE tablename IN ('orders', 'orderdetails', 'users', 'menus', 'inventory', 'reservations')
+WHERE relname IN ('orders', 'orderdetails', 'users', 'menus', 'inventory', 'reservations')
 ORDER BY idx_scan DESC;
 
 -- ============================================================
 -- QUERY 20: Table Statistics for Query Planning
 -- ============================================================
+-- pg_stat_user_tables exposes relname, not tablename.
 SELECT
-    tablename,
-    pg_size_pretty(pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(tablename))) AS total_size,
+    relname AS tablename,
+    pg_size_pretty(pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname))) AS total_size,
     n_live_tup AS row_count,
     n_dead_tup AS dead_rows,
     ROUND(n_dead_tup::NUMERIC / NULLIF(n_live_tup, 0) * 100, 2) AS dead_pct
