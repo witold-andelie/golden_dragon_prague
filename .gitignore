@@ -25,6 +25,7 @@ desktop.ini
 # Generated outputs (can be regenerated)
 samples/dashboard_output/*.csv
 samples/dashboard_output/*.html
+samples/dashboard_output/*.txt
 !samples/dashboard_output/.gitkeep
 
 # Database

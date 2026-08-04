@@ -98,9 +98,15 @@ def generate_revenue_chart(df):
 
 
 def generate_customer_segment_chart(df):
-    """Generate RFM customer segment chart."""
+    """Generate RFM customer segment chart.
+
+    The query already aggregates (GROUP BY segment), so every row is a distinct
+    segment and the counts live in `cnt`. Calling value_counts() on the segment
+    column here would count *rows per segment* - always 1 - and draw a pie of
+    equal slices no matter what the real distribution is. Use `cnt` directly.
+    """
     fig, ax = plt.subplots(figsize=(8, 6))
-    segment_counts = df['segment'].value_counts()
+    segment_counts = df.set_index('segment')['cnt'].sort_values(ascending=False)
     colors = [COLORS['primary'], COLORS['secondary'], COLORS['accent'], '#FF6B6B', '#4ECDC4']
     ax.pie(segment_counts.values, labels=segment_counts.index, autopct='%1.1f%%',
            colors=colors[:len(segment_counts)], startangle=90)
@@ -133,8 +139,20 @@ def generate_dish_chart(df):
 
 
 def generate_hourly_heatmap(df):
-    """Generate hourly demand heatmap."""
+    """Generate hourly demand heatmap.
+
+    Rows are ordered Monday -> Sunday. pivot_table would otherwise sort the
+    weekday_name index alphabetically (Friday, Monday, Saturday, ...), which
+    makes a staff-scheduling chart almost impossible to read. The view exposes
+    day_of_week (ISODOW: 1=Mon .. 7=Sun) precisely so the calendar order can be
+    recovered.
+    """
+    day_order = (df[['day_of_week', 'weekday_name']]
+                 .drop_duplicates()
+                 .sort_values('day_of_week')['weekday_name']
+                 .tolist())
     pivot = df.pivot_table(values='order_count', index='weekday_name', columns='hour_of_day', aggfunc='sum')
+    pivot = pivot.reindex(day_order)
     fig, ax = plt.subplots(figsize=(14, 5))
     sns.heatmap(pivot, annot=True, fmt='g', cmap='YlOrRd', ax=ax, cbar_kws={'label': 'Orders'})
     ax.set_title('Hourly Demand Heatmap (Orders by Day & Hour)', fontsize=14, fontweight='bold', color=COLORS['neutral'])
@@ -258,12 +276,12 @@ def generate_html_report(stats, charts):
             <div class="kpi-card">
                 <div class="kpi-label">Total Revenue</div>
                 <div class="kpi-value">{stats.get('total_revenue_czk', 0):,.0f} CZK</div>
-                <span class="badge badge-primary">Lifetime</span>
+                <span class="badge badge-primary">Completed</span>
             </div>
             <div class="kpi-card">
-                <div class="kpi-label">Total Orders</div>
-                <div class="kpi-value">{stats.get('total_orders', 0):,}</div>
-                <span class="badge badge-secondary">All Time</span>
+                <div class="kpi-label">Completed Orders</div>
+                <div class="kpi-value">{stats.get('completed_orders', 0):,}</div>
+                <span class="badge badge-secondary">of {stats.get('total_orders', 0):,} placed</span>
             </div>
             <div class="kpi-card">
                 <div class="kpi-label">Avg Order Value</div>
@@ -392,6 +410,13 @@ def main():
         cursor.execute("SELECT SUM(total) FROM Orders WHERE status = 'completed'")
         stats['total_revenue_czk'] = cursor.fetchone()[0] or 0
 
+        # Revenue, AOV and VAT are all computed over completed orders only, so the
+        # order KPI reports the completed count too - otherwise the dashboard shows
+        # a revenue figure and an order count that cannot be divided into the AOV
+        # next to them. The all-status count is kept as context on the badge.
+        cursor.execute("SELECT COUNT(*) FROM Orders WHERE status = 'completed'")
+        stats['completed_orders'] = cursor.fetchone()[0]
+
         cursor.execute("SELECT COUNT(*) FROM Orders")
         stats['total_orders'] = cursor.fetchone()[0]
 
@@ -404,7 +429,9 @@ def main():
         cursor.execute("SELECT SUM(vat_amount) FROM Orders WHERE status = 'completed'")
         stats['total_vat_czk'] = cursor.fetchone()[0] or 0
 
-        cursor.execute("SELECT name_en, portions_sold FROM v_top_dishes LIMIT 1")
+        # Explicit ORDER BY: a bare LIMIT 1 over a view leans on the view's own
+        # ORDER BY surviving into the outer plan, which SQL does not guarantee.
+        cursor.execute("SELECT name_en, portions_sold FROM v_top_dishes ORDER BY portions_sold DESC LIMIT 1")
         result = cursor.fetchone()
         if result:
             stats['top_dish'] = result[0]

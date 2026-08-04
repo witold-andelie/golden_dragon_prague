@@ -34,28 +34,44 @@ DB_CONFIG = {
 # Output directory
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'samples', 'dashboard_output')
 
-# Views to export
+# Views to export.
+#
+# This list is meant to cover EVERY view the setup creates, so a BI tool
+# pointed at the CSV folder sees the same surface as one connected live.
+# Grouped by source file to make that easy to audit:
+#
+#   SELECT table_name FROM information_schema.views WHERE table_schema = 'public'
+#   EXCEPT SELECT unnest(ARRAY[...the names below...]);   -- must return 0 rows
 VIEWS_TO_EXPORT = [
+    # 05_views.sql - operational (8)
+    ('v_order_summary', 'order_summary.csv'),
     ('v_kitchen_queue', 'kitchen_queue.csv'),
+    ('v_pending_orders', 'pending_orders.csv'),
     ('v_table_status', 'table_status.csv'),
+    ('v_allergen_warnings', 'allergen_warnings.csv'),
     ('v_daily_revenue', 'daily_revenue.csv'),
     ('v_top_dishes', 'top_dishes.csv'),
-    ('v_allergen_warnings', 'allergen_warnings.csv'),
     ('v_customer_order_history', 'customer_history.csv'),
+
+    # 06_analytics_views.sql - BI (11)
     ('v_customer_rfm', 'customer_rfm.csv'),
+    ('v_cohort_retention', 'cohort_retention.csv'),
     ('v_monthly_revenue_trends', 'monthly_revenue_trends.csv'),
+    ('v_revenue_forecast', 'revenue_forecast.csv'),
     ('v_hourly_demand_patterns', 'hourly_demand.csv'),
     ('v_source_performance', 'source_performance.csv'),
-    ('v_kitchen_efficiency', 'kitchen_efficiency.csv'),
-    ('v_vat_breakdown_monthly', 'vat_breakdown.csv'),
-    ('v_customer_behavior', 'customer_behavior.csv'),
-    ('v_revenue_forecast', 'revenue_forecast.csv'),
-    ('v_top_customers', 'top_customers.csv'),
     ('v_lunch_vs_dinner_analysis', 'lunch_vs_dinner.csv'),
-    ('v_order_summary', 'order_summary.csv'),
+    ('v_vat_breakdown_monthly', 'vat_breakdown.csv'),
+    ('v_kitchen_efficiency', 'kitchen_efficiency.csv'),
+    ('v_top_customers', 'top_customers.csv'),
+    ('v_customer_behavior', 'customer_behavior.csv'),
+
+    # etl_star_schema.sql - warehouse (2)
+    ('v_fact_order_analysis', 'fact_order_analysis.csv'),
+    ('v_dim_customer_history', 'dim_customer_history.csv'),
 ]
 
-# Tables to export
+# Tables to export - all 13 operational tables from 01_schema.sql.
 TABLES_TO_EXPORT = [
     ('Employees', 'employees.csv'),
     ('Users', 'users.csv'),
@@ -69,6 +85,9 @@ TABLES_TO_EXPORT = [
     ('Inventory', 'inventory.csv'),
     ('Allergens', 'allergens.csv'),
     ('MenuAllergens', 'menu_allergens.csv'),
+    # The audit trail is a documented BI source (see docs/BI_DASHBOARD.md,
+    # "Safety & Compliance"), so it belongs in the export.
+    ('OrderAuditLog', 'order_audit_log.csv'),
 ]
 
 
@@ -157,12 +176,16 @@ def export_summary_stats(conn):
         cursor.execute("SELECT COUNT(DISTINCT user_id) FROM Orders WHERE status = 'completed'")
         stats['unique_customers'] = cursor.fetchone()[0]
 
-        # Avg order value
+        # Avg order value. AVG() over zero completed orders returns NULL, and
+        # round(None, 2) raises TypeError - which would abort every stat after
+        # this one on an empty or freshly-truncated database.
         cursor.execute("SELECT AVG(total) FROM Orders WHERE status = 'completed'")
-        stats['avg_order_value_czk'] = round(cursor.fetchone()[0], 2)
+        stats['avg_order_value_czk'] = round(cursor.fetchone()[0] or 0, 2)
 
-        # Top dish
-        cursor.execute("SELECT name_en, portions_sold FROM v_top_dishes LIMIT 1")
+        # Top dish. Explicit ORDER BY: a bare LIMIT 1 over a view leans on the
+        # view's own ORDER BY surviving into the outer plan, which SQL does not
+        # guarantee.
+        cursor.execute("SELECT name_en, portions_sold FROM v_top_dishes ORDER BY portions_sold DESC LIMIT 1")
         result = cursor.fetchone()
         if result:
             stats['top_dish'] = result[0]

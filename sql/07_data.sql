@@ -172,14 +172,14 @@ INSERT INTO Reservations (user_id, table_id, reservation_time, party_size, notes
 -- 'Regular Pricing' row and looked perfectly healthy while doing it.
 -- Orders 1, 9, 11 and 15 now land in the window; 4 sits just past it.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (1, 2, 3, 'dine_in', 'completed', 'walk-in', '2025-06-16 12:30:00',
+VALUES (1, 2, 3, 'dine_in', 'confirmed', 'walk-in', '2025-06-16 12:30:00',
         '{"spicy": "less spicy", "notes": "Small portion for child", "allergies": ["peanuts"]}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (1, 1, 2), (1, 6, 1);
 
 -- Order 2: Delivery via Wolt, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (2, 5, 'delivery', 'completed', 'wolt', '2025-06-18 19:15:00',
+VALUES (2, 5, 'delivery', 'confirmed', 'wolt', '2025-06-18 19:15:00',
         '{"street": "Korunni 45", "city": "Prague 2", "postal": "12000", "note": "2nd floor, buzzer 12"}',
         '{"notes": "Please hurry, I am hungry", "spicy": "extra"}');
 
@@ -187,7 +187,7 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (2, 7, 2), (2, 14,
 
 -- Order 3: Private event, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
-VALUES (3, 1, 'event', 'completed', 'phone', '2025-06-20 18:30:00',
+VALUES (3, 1, 'event', 'confirmed', 'phone', '2025-06-20 18:30:00',
         -- The 'diet' key is what Query 7 in 09_analytics_queries.sql and the GIN
         -- example in docs/ARCHITECTURE.md both search for. No seed order carried
         -- one, so both demonstrated the feature by returning nothing. The notes
@@ -208,13 +208,13 @@ VALUES (3, '2025-06-20 18:30:00', 'Golden Dragon - VIP1 private room', 12);
 -- the 14:30-14:59 gap means that bug can never come back unnoticed: it would
 -- change this order's subtotal from 283.00 to 243.00 the moment it did.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (4, 3, 1, 'dine_in', 'completed', 'phone', '2025-06-23 14:45:00', '{"notes": "Window seat please"}');
+VALUES (4, 3, 1, 'dine_in', 'confirmed', 'phone', '2025-06-23 14:45:00', '{"notes": "Window seat please"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (4, 10, 1), (4, 15, 2);
 
 -- Order 5: Delivery via Bolt, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (5, 5, 'delivery', 'completed', 'bolt', '2025-07-02 20:00:00',
+VALUES (5, 5, 'delivery', 'confirmed', 'bolt', '2025-07-02 20:00:00',
         '{"street": "Vinohradska 12", "city": "Prague 2", "postal": "12000"}',
         '{"notes": "No MSG please", "allergies": ["soy"]}');
 
@@ -222,20 +222,20 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (5, 11, 1), (5, 7,
 
 -- Order 6: Takeaway, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
-VALUES (6, 4, 'takeaway', 'completed', 'walk-in', '2025-07-05 12:15:00', '{"notes": "Extra napkins"}');
+VALUES (6, 4, 'takeaway', 'confirmed', 'walk-in', '2025-07-05 12:15:00', '{"notes": "Extra napkins"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (6, 2, 2), (6, 1, 1);
 
 -- Order 7: Dine-in VIP customer, completed (high value)
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (3, 1, 8, 'dine_in', 'completed', 'walk-in', '2025-07-10 19:30:00',
+VALUES (3, 1, 8, 'dine_in', 'confirmed', 'walk-in', '2025-07-10 19:30:00',
         '{"notes": "VIP customer - best service", "allergies": ["nuts"]}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (7, 8, 1), (7, 4, 2), (7, 16, 2);
 
 -- Order 8: Delivery, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (7, 5, 'delivery', 'completed', 'wolt', '2025-07-12 18:45:00',
+VALUES (7, 5, 'delivery', 'confirmed', 'wolt', '2025-07-12 18:45:00',
         '{"street": "Jilska 5", "city": "Prague 1", "postal": "11000"}',
         '{"notes": "Ring doorbell twice"}');
 
@@ -245,13 +245,15 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (8, 9, 1), (8, 14,
 -- The 9/10/11 "currently active" cluster moves from Sunday 2025-08-03 to
 -- Monday 2025-08-04 so that a "Business lunch" is actually served at lunch.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (1, 2, 6, 'dine_in', 'preparing', 'walk-in', '2025-08-04 12:00:00', '{"notes": "Business lunch"}');
+-- Enters as 'confirmed'; moved to 'preparing' in the ORDER LIFECYCLE block.
+VALUES (1, 2, 6, 'dine_in', 'confirmed', 'walk-in', '2025-08-04 12:00:00', '{"notes": "Business lunch"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (9, 13, 2), (9, 5, 2);
 
 -- Order 10: Delivery, out_for_delivery (active order)
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (8, 5, 'delivery', 'out_for_delivery', 'bolt', '2025-08-04 12:15:00',
+-- Enters as 'confirmed'; walked to 'out_for_delivery' in the LIFECYCLE block.
+VALUES (8, 5, 'delivery', 'confirmed', 'bolt', '2025-08-04 12:15:00',
         '{"street": "Ostrovni 22", "city": "Prague 1", "postal": "11000", "note": "Leave at door"}',
         '{"notes": "Extra sauce"}');
 
@@ -263,22 +265,24 @@ VALUES (4, 6, 5, 'dine_in', 'new', 'walk-in', '2025-08-04 12:30:00', '{"notes": 
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (11, 11, 1);
 
--- Order 12: Event, confirmed (upcoming)
+-- Order 12: Event, confirmed (upcoming) - enters as 'new', confirmed below
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
-VALUES (6, 1, 'event', 'confirmed', 'phone', '2025-08-10 18:00:00',
+VALUES (6, 1, 'event', 'new', 'phone', '2025-08-10 18:00:00',
         '{"event": "Corporate team dinner", "guests": 15, "notes": "Need separate bills"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (12, 8, 2), (12, 10, 2), (12, 16, 5);
 
--- Order 13: Dine-in, cancelled
+-- Order 13: Dine-in, cancelled (see the ORDER LIFECYCLE block below - this row
+-- is inserted as 'confirmed' and cancelled there, because a cancellation has to
+-- be a transition for the restock trigger to see it).
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (2, 4, 2, 'dine_in', 'cancelled', 'walk-in', '2025-07-28 19:00:00', '{"notes": "Cancelled - plans changed"}');
+VALUES (2, 4, 2, 'dine_in', 'confirmed', 'walk-in', '2025-07-28 19:00:00', '{"notes": "Cancelled - plans changed"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (13, 1, 2);
 
 -- Order 14: Delivery, completed (large order)
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (3, 5, 'delivery', 'completed', 'wolt', '2025-07-15 19:00:00',
+VALUES (3, 5, 'delivery', 'confirmed', 'wolt', '2025-07-15 19:00:00',
         '{"street": "Slezska 15", "city": "Prague 2", "postal": "12000", "note": "Office party, 8th floor"}',
         '{"notes": "Include utensils and napkins", "guests": "6"}');
 
@@ -288,7 +292,7 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (14, 6, 2), (14, 7
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
 -- Monday. Was 2025-07-20, a Sunday, despite ordering a Lunch Set off the
 -- lunch menu and saying so in its own notes.
-VALUES (5, 4, 'takeaway', 'completed', 'website', '2025-07-21 11:45:00', '{"notes": "Lunch special"}');
+VALUES (5, 4, 'takeaway', 'confirmed', 'website', '2025-07-21 11:45:00', '{"notes": "Lunch special"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (15, 12, 1);
 
@@ -311,6 +315,46 @@ SELECT finalize_order(12);
 SELECT finalize_order(13);
 SELECT finalize_order(14);
 SELECT finalize_order(15);
+
+-- ============================================================
+-- ORDER LIFECYCLE
+--
+-- Every order above is inserted at the status it ENTERED the system with, then
+-- walked forward to its real status here. That is not decoration: three of the
+-- seven triggers fire on AFTER UPDATE OF status, so an order inserted straight
+-- at its final status never touches any of them.
+--
+-- Seeding the final status directly left all three dead in a fresh build:
+--
+--   trg_order_cancel_restock - order 13's two Spring Rolls were deducted from
+--       Inventory when the line item was added and never came back, because
+--       nothing ever transitioned the order INTO 'cancelled'. Stock was
+--       permanently understated by every cancelled order in the seed.
+--   trg_order_audit_log      - OrderAuditLog was empty in every fresh build,
+--       while the docs advertised it as a compliance audit trail.
+--   trg_order_status         - loyalty points were never awarded, so
+--       Users.loyalty_points was a hand-typed number with no relationship to
+--       the orders sitting in the same file - the same drift that made the
+--       payment amounts wrong.
+--
+-- Users.loyalty_points as seeded is therefore an OPENING BALANCE (history from
+-- before this dataset). The points earned by orders 1-8, 14 and 15 are added on
+-- top by the trigger, exactly as they would be in production.
+-- ============================================================
+UPDATE Orders SET status = 'confirmed'        WHERE order_id = 12;
+UPDATE Orders SET status = 'preparing'        WHERE order_id = 9;
+UPDATE Orders SET status = 'preparing'        WHERE order_id = 10;
+UPDATE Orders SET status = 'out_for_delivery' WHERE order_id = 10;
+UPDATE Orders SET status = 'cancelled'        WHERE order_id = 13;
+UPDATE Orders SET status = 'completed'        WHERE order_id IN (1, 2, 3, 4, 5, 6, 7, 8, 14, 15);
+
+-- OrderAuditLog.changed_at defaults to NOW(), which would stamp this whole
+-- backdated dataset with the build time and make the audit trail useless for
+-- any time-based query. Anchor each entry to its order instead.
+UPDATE OrderAuditLog a
+SET changed_at = o.order_time + INTERVAL '45 minutes'
+FROM Orders o
+WHERE o.order_id = a.order_id;
 
 -- ============================================================
 -- PAYMENTS
@@ -381,4 +425,19 @@ VALUES (9, 'card', 200.00, '2025-08-04 12:10:00', 'Deposit - balance due on coll
 --   fully paid:                      9
 --   partial:                         1   (9)
 --   unpaid:                          5   (1, 3, 11, 12, 13)
+--
+-- OrderAuditLog rows:               15   (one per status transition above:
+--                                        10 completions, 12 confirmed,
+--                                        9 preparing, 10 preparing +
+--                                        out_for_delivery, 13 cancelled.
+--                                        Order 11 never moves off 'new'.)
+--
+-- Users.loyalty_points is an opening balance PLUS points earned here. After the
+-- lifecycle block runs the balances are 253 / 130 / 956 / 71 / 321 / 49 / 187 /
+-- 520 - one point per full 50 CZK of each completed order, on top of the
+-- seeded history. Elena Cerna (user 8) has no orders, so her 520 is untouched;
+-- she is the zero-activity case the RFM and NTILE queries need.
+--
+-- Inventory reflects the cancellation: order 13's 2 Spring Rolls are returned,
+-- so menu_id 1 settles at 82 of its seeded 85 (orders 1 and 6 consumed 3).
 -- ============================================================

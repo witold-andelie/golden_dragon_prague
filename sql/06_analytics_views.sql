@@ -56,7 +56,9 @@ WITH rfm_base AS (
 rfm_scores AS (
     SELECT
         *,
-        -- Score each dimension 1-5 using NTILE (quartile-based)
+        -- Score each dimension 1-5 using NTILE. Five tiles are QUINTILES, not
+        -- quartiles - the standard RFM scale, and what the 1-5 thresholds in
+        -- the segment CASE below are calibrated against.
         NTILE(5) OVER (ORDER BY recency_days DESC) AS r_score,  -- lower days = higher score
         NTILE(5) OVER (ORDER BY frequency) AS f_score,
         NTILE(5) OVER (ORDER BY monetary) AS m_score
@@ -80,7 +82,7 @@ rfm_segments AS (
 )
 SELECT * FROM rfm_segments ORDER BY monetary DESC;
 
-COMMENT ON VIEW v_customer_rfm IS 'RFM customer segmentation using NTILE quartiles. Champions = recent + frequent + high value. Core CRM analytics view.';
+COMMENT ON VIEW v_customer_rfm IS 'RFM customer segmentation using NTILE quintiles (1-5 per dimension). Champions = recent + frequent + high value. Core CRM analytics view.';
 
 -- ============================================================
 -- ANALYTICS VIEW 2: v_cohort_retention

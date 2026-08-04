@@ -95,6 +95,16 @@
 - **Pattern**: Validation trigger
 - **Interview Point**: "This fires before insert or update on Reservations. It calls `is_table_available()` and raises an exception on conflict. This is how you enforce complex business rules at the database level."
 
+### trg_order_audit_log (AFTER UPDATE OF status)
+- **Purpose**: Writes every status change to `OrderAuditLog`
+- **Pattern**: Audit trigger
+- **Interview Point**: "Compliance work needs to answer 'who changed this, to what, and when'. The trigger captures old status, new status and `CURRENT_USER` on every transition. The important design point is that it's driven by the database, not the application - an app that forgets to log, or a manual `UPDATE` run by a DBA, still ends up in the trail."
+
+### trg_order_cancel_restock (AFTER UPDATE OF status)
+- **Purpose**: Returns an order's quantities to `Inventory` when it is cancelled
+- **Pattern**: Compensating trigger with a transition guard
+- **Interview Point**: "Stock is deducted the moment a line item is added, so cancellation needs the mirror operation or inventory leaks on every cancelled order. The subtlety is the `WHEN (NEW.status = 'cancelled' AND OLD.status IS DISTINCT FROM 'cancelled')` clause: it fires on the *transition into* cancelled, not on the state. Without it, re-saving an already-cancelled order restocks the same items again - a classic idempotency bug. I also aggregate the line items by `menu_id` first, because an order can list the same dish twice and `UPDATE ... FROM` would silently apply only one matching row."
+
 ---
 
 ## Analytics Deep Dive (2 minutes each)
@@ -189,6 +199,12 @@ SUM(revenue) OVER (ORDER BY revenue DESC ROWS UNBOUNDED PRECEDING) AS cumulative
 
 ### Window Functions vs Self-Join
 > "Window functions are almost always better than self-joins for running totals and rankings. They compute in a single pass, are more readable, and the optimizer handles them well."
+
+### Seed Data That Actually Exercises the Logic
+> "Three of my triggers fire on `AFTER UPDATE OF status`. The seed data originally inserted every order at its *final* status - completed, cancelled - so none of them ever ran during a build. The audit log was empty, loyalty points were a hand-typed number unrelated to the orders in the same file, and cancelled orders never returned their stock, so inventory was permanently understated. The fix was to insert each order at the status it *entered* with and walk it forward, so the seed runs the real lifecycle. The general lesson: test data that only asserts the end state doesn't test the transitions, and code paths that never run in a build are code paths nobody finds out are broken."
+
+### Deriving Test Data Instead of Typing It
+> "Payment amounts were hand-written and VAT-exclusive, so they had drifted from the VAT-inclusive totals the triggers compute - one order was recorded at 185 against a real 316.96. I now derive each payment from `Orders.total` after finalization rather than typing a number. A menu price change or a VAT rate change can't desynchronise the fixtures any more. Same principle as not hardcoding expected values in a test when you can compute them."
 
 ---
 

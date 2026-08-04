@@ -124,7 +124,7 @@ golden_dragon_prague/
 - **Audit Trail**: `OrderAuditLog` table tracks all status changes
 
 ### 3. Advanced Analytics
-- **RFM Segmentation**: Quartile-based customer tiers (Champion, Loyal, At Risk, Lost)
+- **RFM Segmentation**: Quintile-based customer tiers (Champion, Loyal, At Risk, Lost)
 - **Cohort Analysis**: Customer retention by first purchase month
 - **Revenue Forecasting**: 7-day and 30-day moving averages
 - **Window Functions**: LAG, LEAD, NTILE, ROW_NUMBER, running totals
