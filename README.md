@@ -17,9 +17,9 @@ psql -d golden_dragon_prague -c "SELECT * FROM v_kitchen_queue;"
 | Component | Count | Highlights |
 |-----------|-------|-----------|
 | Tables | 13 | 3NF, foreign keys, check constraints |
-| Indexes | 14+ | B-tree + GIN for JSONB |
-| Functions | 8 | Dynamic pricing, VAT, reservations, analytics |
-| Triggers | 6 | Stock validation, audit trail, loyalty points |
+| Indexes | 22 | B-tree + GIN for JSONB, no redundant duplicates |
+| Functions | 10 | Dynamic pricing, VAT, reservations, analytics |
+| Triggers | 7 | Stock validation, audit trail, loyalty points, restock on cancel |
 | Views | 19 | 8 operational + 11 analytics (RFM, cohort, forecasting) |
 | ETL Procedures | 3 | Star schema load, data quality checks |
 | Python Scripts | 2 | CSV export + HTML dashboard generator |

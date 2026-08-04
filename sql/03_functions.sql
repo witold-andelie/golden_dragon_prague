@@ -8,19 +8,84 @@
 -- ============================================================
 
 -- ============================================================
--- FUNCTION 1: compute_order_totals
--- Calculates subtotal, 12% VAT, and final total for an order
+-- FUNCTION 0: is_lunch_window
+-- THE single definition of the lunch special window.
 --
--- Business Rule: Czech restaurant VAT = 12% (reduced rate for food service)
+-- Business Rule: Mon-Fri, 11:00 up to (but not including) 14:30.
+--
+-- Every consumer - pricing, analytics views, the star-schema ETL - must call
+-- this instead of re-deriving the window. The rule used to be re-implemented
+-- as `EXTRACT(HOUR ...) BETWEEN 11 AND 14`, which silently extends the window
+-- to 14:59 and drifted apart from the documented 14:30 cut-off.
 -- ============================================================
+CREATE OR REPLACE FUNCTION is_lunch_window(p_ts TIMESTAMP)
+RETURNS BOOLEAN
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT p_ts IS NOT NULL
+       AND EXTRACT(ISODOW FROM p_ts) BETWEEN 1 AND 5   -- 1=Monday ... 5=Friday
+       AND p_ts::TIME >= TIME '11:00'
+       AND p_ts::TIME <  TIME '14:30';
+$$;
+
+COMMENT ON FUNCTION is_lunch_window(TIMESTAMP) IS 'Single source of truth for the lunch special window: Mon-Fri, [11:00, 14:30). Half-open interval - an order placed exactly at 14:30 is already regular pricing.';
+
+-- ============================================================
+-- FUNCTION 0b: get_platform_commission_rate
+-- Commission a sales channel charges on gross order value.
+--
+-- Business Rule: only third-party delivery platforms take a cut. Walk-in,
+-- phone and own-website orders cost 0%. Rates mirror dim_channel.
+-- ============================================================
+CREATE OR REPLACE FUNCTION get_platform_commission_rate(p_source VARCHAR)
+RETURNS NUMERIC
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE p_source
+        WHEN 'wolt'      THEN 0.22
+        WHEN 'bolt'      THEN 0.22
+        WHEN 'uber_eats' THEN 0.25
+        ELSE 0
+    END;
+$$;
+
+COMMENT ON FUNCTION get_platform_commission_rate(VARCHAR) IS 'Platform commission by sales channel: Wolt/Bolt 22%, Uber Eats 25%, direct channels (walk-in, phone, website) 0%. Kept in sync with dim_channel.platform_fee_pct.';
+
+-- ============================================================
+-- FUNCTION 1: compute_order_totals
+-- THE single definition of order financials.
+--
+-- Business Rules (order of operations matters):
+--   1. subtotal      = SUM(quantity * unit_price)   -- net of VAT
+--   2. discount      = capped at subtotal (a discount cannot exceed the goods)
+--   3. delivery fee  = 49 CZK on delivery orders under 350 CZK net of discount
+--   4. taxable base  = subtotal - discount + delivery fee
+--   5. VAT           = base * vat_rate   (12% Czech reduced rate for food service)
+--   6. total         = base + VAT
+--
+-- The discount reduces the TAXABLE BASE - it is a price reduction, not a
+-- post-tax rebate. Applying it after VAT (the old behaviour) over-declares
+-- output VAT to the tax office and makes total != base + VAT.
+-- ============================================================
+-- The return type changes, and CREATE OR REPLACE cannot change a function's
+-- result type, so drop the old signature first.
+DROP FUNCTION IF EXISTS compute_order_totals(INT);
+
 CREATE OR REPLACE FUNCTION compute_order_totals(p_order_id INT)
 RETURNS TABLE (
-    calc_subtotal NUMERIC,
-    calc_vat      NUMERIC,
-    calc_total    NUMERIC
+    calc_subtotal     NUMERIC,
+    calc_discount     NUMERIC,
+    calc_delivery_fee NUMERIC,
+    calc_taxable_base NUMERIC,
+    calc_vat          NUMERIC,
+    calc_total        NUMERIC
 ) AS $$
 DECLARE
     v_subtotal NUMERIC;
+    v_discount NUMERIC;
+    v_fee      NUMERIC := 0;
+    v_type     TEXT;
+    v_rate     NUMERIC;
+    v_base     NUMERIC;
+    v_vat      NUMERIC;
 BEGIN
     -- Sum all line items: quantity * unit_price
     SELECT COALESCE(SUM(quantity * unit_price), 0)
@@ -28,28 +93,38 @@ BEGIN
     FROM OrderDetails
     WHERE order_id = p_order_id;
 
-    -- Czech VAT: 12% of subtotal
-    RETURN QUERY
-    SELECT
-        v_subtotal,
-        ROUND(v_subtotal * 0.12, 2) AS vat,
-        ROUND(v_subtotal * 1.12, 2) AS total;
-END;
-$$ LANGUAGE plpgsql;
+    -- vat_rate lives on the order so a historical rate stays reproducible;
+    -- do not hardcode 0.12 here or reprinting an old invoice silently re-rates it.
+    SELECT o.order_type, COALESCE(o.discount_amount, 0), COALESCE(o.vat_rate, 0.12)
+    INTO v_type, v_discount, v_rate
+    FROM Orders o
+    WHERE o.order_id = p_order_id;
 
-COMMENT ON FUNCTION compute_order_totals(INT) IS 'Calculates order financials: subtotal + 12% Czech VAT + total. Pure function - no side effects.';
+    v_discount := LEAST(GREATEST(v_discount, 0), v_subtotal);
+
+    -- Delivery fee: 49 CZK if the discounted goods value is under 350 CZK
+    IF v_type = 'delivery' AND (v_subtotal - v_discount) < 350 THEN
+        v_fee := 49;
+    END IF;
+
+    v_base := v_subtotal - v_discount + v_fee;
+    v_vat  := ROUND(v_base * v_rate, 2);
+
+    RETURN QUERY SELECT v_subtotal, v_discount, v_fee, v_base, v_vat, ROUND(v_base + v_vat, 2);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION compute_order_totals(INT) IS 'Single source of truth for order financials. Discount reduces the taxable base, then VAT (Orders.vat_rate, 12% Czech reduced rate) is applied to subtotal - discount + delivery fee. Pure read - no side effects.';
 
 -- ============================================================
 -- FUNCTION 2: get_effective_price
 -- Returns lunch price if order falls within lunch window, else regular price
 --
--- Business Rule: Lunch specials apply Mon-Fri 11:00-14:30
+-- Business Rule: Lunch specials apply Mon-Fri 11:00-14:30 (see is_lunch_window)
 -- ============================================================
 CREATE OR REPLACE FUNCTION get_effective_price(p_menu_id INT, p_order_time TIMESTAMP)
 RETURNS NUMERIC AS $$
 DECLARE
-    v_hour     INT := EXTRACT(HOUR FROM p_order_time);
-    v_weekday  INT := EXTRACT(ISODOW FROM p_order_time); -- 1=Monday ... 7=Sunday
     v_regular  NUMERIC;
     v_lunch    NUMERIC;
 BEGIN
@@ -58,10 +133,8 @@ BEGIN
     FROM Menus
     WHERE menu_id = p_menu_id;
 
-    -- Lunch special: weekday (Mon-Fri) AND hour 11-14 AND lunch price exists
-    IF v_weekday BETWEEN 1 AND 5
-       AND v_hour BETWEEN 11 AND 14
-       AND v_lunch IS NOT NULL THEN
+    -- Window rule is owned by is_lunch_window(); never re-derive it here.
+    IF v_lunch IS NOT NULL AND is_lunch_window(p_order_time) THEN
         RETURN v_lunch;
     END IF;
 
@@ -69,7 +142,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION get_effective_price(INT, TIMESTAMP) IS 'Dynamic pricing: returns lunch price during lunch window (Mon-Fri 11:00-14:30), else regular price.';
+COMMENT ON FUNCTION get_effective_price(INT, TIMESTAMP) IS 'Dynamic pricing: returns lunch price during is_lunch_window() (Mon-Fri 11:00-14:30), else regular price.';
 
 -- ============================================================
 -- FUNCTION 3: is_table_available
@@ -140,44 +213,29 @@ COMMENT ON FUNCTION create_reservation(INT, INT, TIMESTAMP, SMALLINT, TEXT) IS '
 
 -- ============================================================
 -- FUNCTION 5: finalize_order
--- Recalculates order totals, applies delivery fee rules
+-- Persists the financials computed by compute_order_totals()
 --
--- Business Rules:
--- - Delivery fee: +49 CZK if subtotal < 350 CZK
--- - Discounts applied before totals
+-- This function deliberately contains NO arithmetic. The delivery-fee rule and
+-- the discount/VAT ordering used to be duplicated here and in
+-- compute_order_totals(), and the two copies disagreed: this one added the fee
+-- after VAT and subtracted the discount after VAT, so Orders.total did not
+-- equal subtotal + vat_amount + delivery_fee - discount for any order that had
+-- either. All of it now lives in compute_order_totals().
 -- ============================================================
 CREATE OR REPLACE FUNCTION finalize_order(p_order_id INT) RETURNS VOID AS $$
-DECLARE
-    v_subtotal NUMERIC;
-    v_vat      NUMERIC;
-    v_total    NUMERIC;
-    v_type     TEXT;
-    v_fee      NUMERIC := 0;
 BEGIN
-    -- Get calculated totals from compute_order_totals
-    SELECT calc_subtotal, calc_vat, calc_total
-    INTO v_subtotal, v_vat, v_total
-    FROM compute_order_totals(p_order_id);
-
-    -- Get order type for delivery fee rule
-    SELECT order_type INTO v_type FROM Orders WHERE order_id = p_order_id;
-
-    -- Delivery fee: 49 CZK if subtotal under 350 CZK (Wolt/Bolt style)
-    IF v_type = 'delivery' AND v_subtotal < 350 THEN
-        v_fee := 49;
-    END IF;
-
-    -- Update order with final amounts
-    UPDATE Orders
-    SET subtotal     = v_subtotal,
-        vat_amount   = v_vat,
-        total        = v_total + v_fee - COALESCE(discount_amount, 0),
-        delivery_fee = v_fee
-    WHERE order_id = p_order_id;
+    UPDATE Orders o
+    SET subtotal        = c.calc_subtotal,
+        discount_amount = c.calc_discount,
+        delivery_fee    = c.calc_delivery_fee,
+        vat_amount      = c.calc_vat,
+        total           = c.calc_total
+    FROM compute_order_totals(p_order_id) c
+    WHERE o.order_id = p_order_id;
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION finalize_order(INT) IS 'Recalculates order totals after adding/removing items. Applies delivery fee rule. Called by trigger after each OrderDetails insert.';
+COMMENT ON FUNCTION finalize_order(INT) IS 'Writes the financials from compute_order_totals() onto the order. Called by trigger after each OrderDetails insert. Holds no arithmetic of its own.';
 
 -- ============================================================
 -- FUNCTION 6: get_customer_lifetime_value
@@ -280,7 +338,11 @@ COMMENT ON FUNCTION get_daily_summary(DATE) IS 'Daily operational dashboard: ord
 -- ============================================================
 -- FUNCTIONS REGISTERED
 -- ============================================================
--- Total: 8 functions
+-- Total: 10 functions
+--
+-- Business-Rule Primitives (IMMUTABLE, one definition each):
+--   - is_lunch_window             → Lunch special window (Mon-Fri 11:00-14:30)
+--   - get_platform_commission_rate → Channel commission (Wolt/Bolt 22%, direct 0%)
 --
 -- Pure Functions (no side effects):
 --   - compute_order_totals      → Financial calculation
@@ -297,4 +359,5 @@ COMMENT ON FUNCTION get_daily_summary(DATE) IS 'Daily operational dashboard: ord
 -- Called By:
 --   - Triggers (auto): get_effective_price, finalize_order, compute_order_totals
 --   - Application (manual): create_reservation, analytics functions
+--   - Views/ETL: is_lunch_window, get_platform_commission_rate
 -- ============================================================

@@ -69,7 +69,7 @@ golden_dragon_prague/
 │   ├── 01_schema.sql          # 13 tables with full documentation
 │   ├── 02_indexes.sql         # B-tree + GIN indexes
 │   ├── 03_functions.sql       # 8 PL/pgSQL business functions
-│   ├── 04_triggers.sql        # 6 triggers (validation, audit, automation)
+│   ├── 04_triggers.sql        # 7 triggers (validation, audit, automation)
 │   ├── 05_views.sql           # 8 operational views
 │   ├── 06_analytics_views.sql # 11 advanced BI views
 │   ├── 07_data.sql            # Realistic sample data (15+ orders)
@@ -99,8 +99,8 @@ golden_dragon_prague/
 |-----------|-------|---------|
 | Tables | 13 | 3NF normalized, foreign keys, check constraints |
 | Indexes | 14+ | B-tree + GIN (JSONB), composite indexes |
-| Functions | 8 | PL/pgSQL: pricing, VAT, reservations, analytics |
-| Triggers | 6 | BEFORE/AFTER, conditional, audit trail |
+| Functions | 10 | PL/pgSQL: pricing, VAT, reservations, analytics |
+| Triggers | 7 | BEFORE/AFTER, conditional, audit trail |
 | Views | 19 | Operational (8) + Analytics (11) |
 | Stored Procedures | 3 | ETL pipeline, data quality checks |
 | JSONB Columns | 2 | GIN indexed for fast queries |

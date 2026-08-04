@@ -77,26 +77,61 @@ ORDER BY estimated_net_revenue DESC;
 
 -- ============================================================
 -- QUERY 6: Revenue Contribution by Menu Category (ROLLUP)
+--
+-- Two things this query gets wrong if written the obvious way:
+--
+--  1. GROUP BY ROLLUP(c.category_id, c.name_en) is a rollup over two columns
+--     that determine each other, so it emits each category TWICE - once as
+--     (id, name) and once as (id, NULL) - plus the grand total.
+--     ROLLUP((c.category_id, c.name_en)) treats the pair as ONE level, which is
+--     what "subtotal per category" actually means.
+--
+--  2. SUM(SUM(...)) OVER () as the denominator sums the grand-total row on top
+--     of the detail rows, so every percentage came out halved (and with the
+--     duplicate rows above, quartered). The denominator has to come from the
+--     detail grain only - here, a scalar subquery over the same CTE.
 -- ============================================================
+WITH category_revenue AS (
+    SELECT
+        c.category_id,
+        c.name_en                        AS category,
+        COUNT(od.order_detail_id)        AS items_sold,
+        SUM(od.quantity)                 AS portions,
+        SUM(od.quantity * od.unit_price) AS revenue
+    FROM OrderDetails od
+    JOIN Menus m ON od.menu_id = m.menu_id
+    JOIN MenuCategories c ON m.category_id = c.category_id
+    JOIN Orders o ON od.order_id = o.order_id AND o.status = 'completed'
+    GROUP BY c.category_id, c.name_en
+)
 SELECT
-    COALESCE(c.name_en, 'TOTAL') AS category,
-    COUNT(od.order_detail_id) AS items_sold,
-    SUM(od.quantity) AS portions,
-    SUM(od.quantity * od.unit_price) AS revenue,
-    ROUND(SUM(od.quantity * od.unit_price) / NULLIF(SUM(SUM(od.quantity * od.unit_price)) OVER (), 0) * 100, 2) AS pct_of_total
-FROM OrderDetails od
-JOIN Menus m ON od.menu_id = m.menu_id
-JOIN MenuCategories c ON m.category_id = c.category_id
-JOIN Orders o ON od.order_id = o.order_id AND o.status = 'completed'
-GROUP BY ROLLUP(c.category_id, c.name_en)
-ORDER BY category;
+    COALESCE(category, 'TOTAL') AS category,
+    SUM(items_sold)             AS items_sold,
+    SUM(portions)               AS portions,
+    SUM(revenue)                AS revenue,
+    ROUND(
+        SUM(revenue) / NULLIF((SELECT SUM(revenue) FROM category_revenue), 0) * 100,
+        2
+    ) AS pct_of_total
+FROM category_revenue
+GROUP BY ROLLUP((category_id, category))
+ORDER BY GROUPING(category_id), category;   -- TOTAL last, not sorted alphabetically
 
 -- ============================================================
 -- QUERY 7: Advanced JSONB Query - Extract all dietary restrictions
+--
+-- The filter was `special_requests ->> 'diet' IS NOT NULL`, which contradicts
+-- both the title and the six allergy columns this query selects: it threw away
+-- every order that declared an allergy but no diet. No seed order carries a
+-- 'diet' key, so the query returned zero rows on every run - an empty result
+-- from a kitchen-facing query reads as "no restrictions to worry about".
+--
+-- `?|` matches an order carrying EITHER key, and unlike `->> ... IS NOT NULL`
+-- it is a GIN-indexable operator, so idx_special_requests_gin can serve it.
 -- ============================================================
 SELECT
     order_id,
-    u.full_name,
+    COALESCE(u.full_name, 'Walk-in / Unknown') AS full_name,
     o.order_time,
     -- Extract specific JSONB fields
     o.special_requests ->> 'diet' AS diet,
@@ -109,9 +144,10 @@ SELECT
     -- JSONB path query (PostgreSQL 12+)
     jsonb_path_query_array(o.special_requests, '$.allergies[*]') AS allergies_list
 FROM Orders o
-JOIN Users u ON o.user_id = u.user_id
-WHERE o.special_requests IS NOT NULL
-  AND o.special_requests ->> 'diet' IS NOT NULL
+-- LEFT JOIN: a walk-in order has no user_id, and its allergy note matters just
+-- as much as a registered customer's.
+LEFT JOIN Users u ON o.user_id = u.user_id
+WHERE o.special_requests ?| ARRAY['diet', 'allergies']
 ORDER BY o.order_time DESC;
 
 -- ============================================================
@@ -188,29 +224,43 @@ WITH customer_freq AS (
         u.user_id,
         u.full_name,
         COUNT(o.order_id) AS order_count,
-        SUM(o.total) AS lifetime_value
+        -- COALESCE, not a bare SUM: the LEFT JOIN yields NULL for a customer who
+        -- has never completed an order, and in an ASC sort Postgres puts NULLs
+        -- LAST - so the one person who has spent nothing was ranked above
+        -- everyone who has, landing in value_tier 4 and getting labelled
+        -- 'BIG SPENDER'. A customer who has spent nothing has spent 0.
+        COALESCE(SUM(o.total), 0) AS lifetime_value
     FROM Users u
     LEFT JOIN Orders o ON u.user_id = o.user_id AND o.status = 'completed'
     WHERE u.role IN ('customer', 'vip')   -- 'vip' is a customer tier, not a separate audience
     GROUP BY u.user_id, u.full_name
+),
+-- NTILE numbers the tiles in the sort order given: with ORDER BY ... DESC the
+-- BEST customers land in tile 1 and the worst in tile 4, so testing `tier >= 3`
+-- labelled the bottom half 'HIGH VALUE' and the top half 'STANDARD' - exactly
+-- inverted. Sorting ascending makes tier 4 the top quartile, which is how the
+-- labels below (and every other tiering in this project) read it.
+tiered AS (
+    SELECT
+        *,
+        NTILE(4) OVER (ORDER BY order_count)    AS frequency_tier,  -- 4 = most orders
+        NTILE(4) OVER (ORDER BY lifetime_value) AS value_tier       -- 4 = highest spend
+    FROM customer_freq
 )
 SELECT
     user_id,
     full_name,
     order_count,
     lifetime_value,
-    -- Divide customers into 4 tiers by frequency
-    NTILE(4) OVER (ORDER BY order_count DESC) AS frequency_tier,
-    -- Divide customers into 4 tiers by value
-    NTILE(4) OVER (ORDER BY lifetime_value DESC) AS value_tier,
+    frequency_tier,
+    value_tier,
     CASE
-        WHEN NTILE(4) OVER (ORDER BY order_count DESC) >= 3
-             AND NTILE(4) OVER (ORDER BY lifetime_value DESC) >= 3 THEN 'HIGH VALUE'
-        WHEN NTILE(4) OVER (ORDER BY order_count DESC) >= 3 THEN 'FREQUENT'
-        WHEN NTILE(4) OVER (ORDER BY lifetime_value DESC) >= 3 THEN 'BIG SPENDER'
+        WHEN frequency_tier >= 3 AND value_tier >= 3 THEN 'HIGH VALUE'
+        WHEN frequency_tier >= 3                     THEN 'FREQUENT'
+        WHEN value_tier     >= 3                     THEN 'BIG SPENDER'
         ELSE 'STANDARD'
     END AS customer_class
-FROM customer_freq
+FROM tiered
 ORDER BY lifetime_value DESC;
 
 -- ============================================================
@@ -356,7 +406,7 @@ WHERE status IS NOT NULL AND order_time IS NULL;
 -- Should use idx_special_requests_gin (GIN index)
 -- EXPLAIN ANALYZE SELECT * FROM Orders WHERE special_requests @> '{"diet":"vegetarian"}';
 
--- Should use idx_orders_time index
+-- Should use idx_orders_date_status (order_time is its leading column)
 -- EXPLAIN ANALYZE SELECT * FROM Orders WHERE order_time BETWEEN '2025-01-01' AND '2025-12-31';
 
 -- Should use idx_orderdetails_order + idx_menus_category
@@ -440,22 +490,55 @@ LIMIT 5;
 
 -- ============================================================
 -- QUERY 17: Multi-dimensional Analysis - Revenue by Month, Type, and Source
+--
+-- Same denominator trap as Query 6, one dimension deeper. A window SUM over a
+-- ROLLUP result set adds the (month), (month, type) and grand-total rows to the
+-- detail rows, so `SUM(SUM(total)) OVER (PARTITION BY month)` returned roughly
+-- three times each month's real revenue and every percentage came out at about
+-- a third of the truth. Aggregating the detail grain in a CTE first gives an
+-- honest denominator per month, and GROUPING() picks the right one for the
+-- rows where the month itself has been rolled up.
 -- ============================================================
+WITH base AS (
+    SELECT
+        TO_CHAR(order_time, 'YYYY-MM') AS month,
+        order_type,
+        source,
+        COUNT(*)   AS orders,
+        SUM(total) AS revenue
+    FROM Orders
+    WHERE status = 'completed'
+    GROUP BY 1, 2, 3
+),
+monthly_totals AS (
+    SELECT month, SUM(revenue) AS month_revenue
+    FROM base
+    GROUP BY month
+)
 SELECT
-    TO_CHAR(order_time, 'YYYY-MM') AS month,
-    order_type,
-    source,
-    COUNT(*) AS orders,
-    SUM(total) AS revenue,
-    ROUND(AVG(total), 2) AS avg_order_value,
+    COALESCE(b.month,      'ALL MONTHS') AS month,
+    COALESCE(b.order_type, 'ALL TYPES')  AS order_type,
+    COALESCE(b.source,     'ALL SOURCES') AS source,
+    SUM(b.orders)  AS orders,
+    SUM(b.revenue) AS revenue,
+    -- Revenue-weighted, unlike AVG() over pre-aggregated rows
+    ROUND(SUM(b.revenue) / NULLIF(SUM(b.orders), 0), 2) AS avg_order_value,
     ROUND(
-        SUM(total) / SUM(SUM(total)) OVER (PARTITION BY TO_CHAR(order_time, 'YYYY-MM')) * 100,
+        SUM(b.revenue) / NULLIF(
+            CASE WHEN GROUPING(b.month) = 0
+                 -- inside one month: month_revenue is constant, MAX just picks it
+                 THEN MAX(mt.month_revenue)
+                 -- month rolled up: compare against all-time revenue
+                 ELSE (SELECT SUM(month_revenue) FROM monthly_totals)
+            END, 0) * 100,
         2
     ) AS pct_of_monthly_revenue
-FROM Orders
-WHERE status = 'completed'
-GROUP BY ROLLUP(TO_CHAR(order_time, 'YYYY-MM'), order_type, source)
-ORDER BY month, order_type, source;
+FROM base b
+JOIN monthly_totals mt ON mt.month = b.month
+GROUP BY ROLLUP(b.month, b.order_type, b.source)
+ORDER BY GROUPING(b.month), b.month,
+         GROUPING(b.order_type), b.order_type,
+         GROUPING(b.source), b.source;
 
 -- ============================================================
 -- QUERY 18: Advanced CTE - Customer Journey Analysis
@@ -472,11 +555,9 @@ WITH customer_journey AS (
         COUNT(o.order_id) AS total_orders,
         -- Total spent
         SUM(o.total) AS total_spent,
-        -- First order was lunch?
-        BOOL_OR(
-            EXTRACT(HOUR FROM o.order_time) BETWEEN 11 AND 14
-            AND EXTRACT(ISODOW FROM o.order_time) BETWEEN 1 AND 5
-        ) AS started_with_lunch,
+        -- Has this customer ever ordered in the lunch window?
+        -- Window rule comes from is_lunch_window(), never re-derived inline.
+        BOOL_OR(is_lunch_window(o.order_time)) AS ordered_in_lunch_window,
         -- Preferred channel
         MODE() WITHIN GROUP (ORDER BY o.source) AS preferred_source,
         -- Days between first and last order
@@ -494,7 +575,7 @@ SELECT
     ROUND(total_spent / NULLIF(total_orders, 0), 2) AS avg_order,
     customer_lifespan_days,
     ROUND(total_spent / NULLIF(customer_lifespan_days, 0), 2) AS revenue_per_day,
-    started_with_lunch,
+    ordered_in_lunch_window,
     preferred_source,
     CASE
         WHEN total_orders = 1 THEN 'One-time'

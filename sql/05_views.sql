@@ -133,28 +133,40 @@ COMMENT ON VIEW v_top_dishes IS 'Menu item performance: portions sold, revenue, 
 -- Business Use: Kitchen cross-contamination prevention
 -- Legal: EU Regulation 1169/2011 compliance
 -- ============================================================
+-- LEFT JOIN on MenuAllergens/Allergens, not INNER: with inner joins a dish only
+-- reached the view if it already had at least one allergen row, so the 'SAFE'
+-- branch of safety_flag was unreachable and an allergen-free dish simply
+-- vanished from the kitchen's checklist. A dish missing from a safety view
+-- reads as "not checked yet", which is exactly the ambiguity the view exists to
+-- remove - every dish on every open order must appear, explicitly flagged.
+-- Users is also LEFT-joined: a walk-in order has no user_id and must not be
+-- dropped from a safety-critical view.
 CREATE OR REPLACE VIEW v_allergen_warnings AS
 SELECT
     o.order_id,
     o.status,
     o.order_type,
     rt.table_number,
-    u.full_name   AS customer,
+    COALESCE(u.full_name, 'Walk-in / Unknown') AS customer,
     m.name_en     AS dish,
-    string_agg(DISTINCT a.name_en, ', ') AS allergens_present,
-    CASE WHEN COUNT(DISTINCT ma.allergen_id) > 0 THEN 'WARNING' ELSE 'SAFE' END AS safety_flag
+    COALESCE(string_agg(DISTINCT a.name_en, ', '), 'None declared') AS allergens_present,
+    COUNT(DISTINCT ma.allergen_id)                                  AS allergen_count,
+    CASE WHEN COUNT(DISTINCT ma.allergen_id) > 0 THEN 'WARNING' ELSE 'SAFE' END AS safety_flag,
+    -- Cross-check against what the customer told us, so the kitchen sees the
+    -- collision on one row instead of joining two views by eye.
+    o.special_requests -> 'allergies' AS customer_declared_allergies
 FROM Orders o
-JOIN Users u            ON o.user_id = u.user_id
-JOIN OrderDetails od    ON o.order_id = od.order_id
-JOIN Menus m            ON od.menu_id = m.menu_id
-JOIN MenuAllergens ma   ON m.menu_id = ma.menu_id
-JOIN Allergens a        ON ma.allergen_id = a.allergen_id
+LEFT JOIN Users u            ON o.user_id = u.user_id
+JOIN OrderDetails od         ON o.order_id = od.order_id
+JOIN Menus m                 ON od.menu_id = m.menu_id
+LEFT JOIN MenuAllergens ma   ON m.menu_id = ma.menu_id
+LEFT JOIN Allergens a        ON ma.allergen_id = a.allergen_id
 LEFT JOIN RestaurantTables rt ON o.table_id = rt.table_id
 WHERE o.status NOT IN ('completed', 'cancelled')
-GROUP BY o.order_id, o.status, o.order_type, rt.table_number, u.full_name, m.name_en, m.menu_id
+GROUP BY o.order_id, o.status, o.order_type, rt.table_number, u.full_name, m.name_en, m.menu_id, o.special_requests
 ORDER BY o.order_id, m.menu_id;
 
-COMMENT ON VIEW v_allergen_warnings IS 'CRITICAL SAFETY VIEW: allergen declarations for all open orders. Kitchen uses this to prevent cross-contamination. EU legal requirement.';
+COMMENT ON VIEW v_allergen_warnings IS 'CRITICAL SAFETY VIEW: allergen declarations for every dish on every open order, including allergen-free dishes (safety_flag = SAFE). Kitchen uses this to prevent cross-contamination. EU legal requirement.';
 
 -- ============================================================
 -- VIEW 6: v_customer_order_history
@@ -188,14 +200,73 @@ COMMENT ON VIEW v_customer_order_history IS 'Customer 360-view: order history, l
 
 -- ============================================================
 -- VIEW 7: v_pending_orders
--- Orders awaiting action (pending + confirmed)
+-- Orders still awaiting action, oldest and most urgent first
 --
 -- Business Use: Operations dashboard, staff task assignment
+--
+-- This was a placeholder (`SELECT * FROM v_customer_order_history WHERE 1=0`)
+-- that returned zero rows with customer-history columns, so the operations
+-- dashboard it backs always looked empty - "nothing outstanding" is the most
+-- dangerous thing an empty ops view can wrongly say.
+--
+-- "Pending" here means every status between placed and closed. Orders.status
+-- has no literal 'pending' value; the open states are new -> confirmed ->
+-- preparing -> ready -> out_for_delivery, and closed ones are completed and
+-- cancelled.
 -- ============================================================
-CREATE OR REPLACE VIEW v_pending_orders AS
-SELECT * FROM v_customer_order_history WHERE 1=0;  -- placeholder
+-- Column list changes completely, and CREATE OR REPLACE VIEW cannot do that.
+DROP VIEW IF EXISTS v_pending_orders;
 
-COMMENT ON VIEW v_pending_orders IS 'Orders requiring action: pending (awaiting confirmation) and confirmed (awaiting preparation).';
+CREATE VIEW v_pending_orders AS
+WITH open_orders AS (
+    SELECT
+        o.order_id,
+        o.order_time,
+        o.status,
+        o.order_type,
+        o.source,
+        COALESCE(u.full_name, 'Walk-in / Unknown') AS customer,
+        u.phone                                    AS customer_phone,
+        rt.table_number,
+        emp.full_name                              AS assigned_staff,
+        o.delivery_address ->> 'street'            AS delivery_street,
+        o.special_requests ->> 'notes'             AS order_notes,
+        o.total,
+        items.item_count,
+        items.total_items,
+        items.est_prep_minutes,
+        FLOOR(EXTRACT(EPOCH FROM (NOW() - o.order_time)) / 60)::INT AS minutes_waiting
+    FROM Orders o
+    LEFT JOIN Users u             ON o.user_id     = u.user_id
+    LEFT JOIN RestaurantTables rt ON o.table_id    = rt.table_id
+    LEFT JOIN Employees emp       ON o.employee_id = emp.employee_id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)                                            AS item_count,
+               COALESCE(SUM(od.quantity), 0)                       AS total_items,
+               COALESCE(SUM(m.estimated_prep_minutes * od.quantity), 0) AS est_prep_minutes
+        FROM OrderDetails od
+        JOIN Menus m ON od.menu_id = m.menu_id
+        WHERE od.order_id = o.order_id
+    ) items ON TRUE
+    WHERE o.status IN ('new', 'confirmed', 'preparing', 'ready', 'out_for_delivery')
+)
+SELECT
+    *,
+    CASE
+        WHEN est_prep_minutes = 0                          THEN 'NO ITEMS'
+        WHEN minutes_waiting > est_prep_minutes * 2        THEN 'OVERDUE'
+        WHEN minutes_waiting > est_prep_minutes            THEN 'LATE'
+        ELSE 'ON TRACK'
+    END AS sla_flag
+FROM open_orders
+ORDER BY
+    CASE status
+        WHEN 'new' THEN 1 WHEN 'confirmed' THEN 2 WHEN 'preparing' THEN 3
+        WHEN 'ready' THEN 4 WHEN 'out_for_delivery' THEN 5 ELSE 6
+    END,
+    order_time ASC;
+
+COMMENT ON VIEW v_pending_orders IS 'Orders requiring action (new, confirmed, preparing, ready, out_for_delivery) with wait time, assigned staff and an SLA flag derived from the kitchen prep estimate. Backs the operations dashboard.';
 
 -- ============================================================
 -- VIEW 8: v_order_summary (enriched)

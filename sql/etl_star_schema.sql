@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS dim_date (
     day_name          VARCHAR(10) NOT NULL,
     month_name        VARCHAR(10) NOT NULL,
     is_weekend        BOOLEAN NOT NULL,
-    is_lunch_special  BOOLEAN NOT NULL,  -- Mon-Fri 11:00-14:30
+    -- Day-grain only: "is the lunch special offered on this day" (Mon-Fri).
+    -- The 11:00-14:30 part of the rule is time-of-day and lives on
+    -- fact_orders.is_lunch_order, which calls is_lunch_window().
+    is_lunch_special  BOOLEAN NOT NULL,
     fiscal_year       INT,
     fiscal_quarter    INT
 );
@@ -344,11 +347,11 @@ BEGIN
         o.status,
         EXTRACT(HOUR FROM o.order_time)::INT,
         EXTRACT(ISODOW FROM o.order_time)::INT,
-        CASE
-            WHEN EXTRACT(HOUR FROM o.order_time) BETWEEN 11 AND 14
-                 AND EXTRACT(ISODOW FROM o.order_time) BETWEEN 1 AND 5
-            THEN TRUE ELSE FALSE
-        END
+        -- Same window function the pricing path uses. Re-deriving it here as
+        -- `HOUR BETWEEN 11 AND 14` stretched the window to 14:59, so the
+        -- warehouse flagged orders as lunch that were charged regular prices -
+        -- the fact table then disagreed with OLTP about its own rows.
+        is_lunch_window(o.order_time)
     FROM OrderDetails od
     JOIN Orders o ON od.order_id = o.order_id
     -- LEFT JOIN: walk-in orders have no user_id and must not be dropped.
@@ -446,13 +449,27 @@ BEGIN
     INSERT INTO data_quality_audit (check_name, table_name, expected_count, actual_count, discrepancy, status, notes)
     VALUES (v_check_name, v_table_name, 0, v_actual, v_actual, v_status, v_notes);
 
-    -- Check 4: Order totals match sum of details
+    -- Check 4: Order financials match the canonical recomputation.
+    --
+    -- This check used to compare Orders.total against SUM(quantity*unit_price),
+    -- i.e. a VAT-inclusive total against a VAT-exclusive subtotal. Those two can
+    -- never be equal for a non-zero order, so the check reported FAIL on every
+    -- single run and told the operator nothing: a monitor that is always red is
+    -- indistinguishable from one that is broken, and gets ignored either way.
+    --
+    -- It now re-derives the financials with compute_order_totals() - the same
+    -- function the write path uses - and compares field by field, so it fails
+    -- only when a stored order really has drifted from its line items.
     v_check_name := 'order_totals_mismatch';
     v_table_name := 'Orders';
     SELECT COUNT(*) INTO v_actual
     FROM Orders o
+    CROSS JOIN LATERAL compute_order_totals(o.order_id) c
     WHERE o.status = 'completed'
-      AND ABS(o.total - (SELECT COALESCE(SUM(quantity * unit_price), 0) FROM OrderDetails WHERE order_id = o.order_id)) > 0.01;
+      AND (ABS(COALESCE(o.subtotal, 0)     - c.calc_subtotal)     > 0.01
+        OR ABS(COALESCE(o.vat_amount, 0)   - c.calc_vat)          > 0.01
+        OR ABS(COALESCE(o.delivery_fee, 0) - c.calc_delivery_fee) > 0.01
+        OR ABS(COALESCE(o.total, 0)        - c.calc_total)        > 0.01);
     v_status := CASE WHEN v_actual = 0 THEN 'PASS' ELSE 'FAIL' END;
     v_notes := CASE WHEN v_actual = 0 THEN 'All order totals correct' ELSE v_actual || ' orders with total mismatch' END;
 
@@ -605,8 +622,13 @@ CREATE INDEX IF NOT EXISTS idx_mv_daily_kpi_date ON mv_daily_kpi(date_key);
 -- ============================================================
 -- RUN INITIAL ETL LOAD
 -- ============================================================
--- Load existing operational data into fact table
-CALL sp_load_fact_orders();
+-- Run the full pipeline, not just the fact load. The setup used to call
+-- sp_load_fact_orders() alone, so sp_run_data_quality_checks() never executed
+-- during a build and data_quality_audit came out holding a single row. Every
+-- check in it - orphan details, negative inventory, totals drift, missing
+-- payments - was written, wired up, and then never asked. Checks that do not
+-- run on every build are checks nobody finds out about.
+CALL sp_daily_etl_pipeline();
 
 -- Refresh materialized views
 REFRESH MATERIALIZED VIEW mv_daily_kpi;

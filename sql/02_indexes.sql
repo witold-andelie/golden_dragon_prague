@@ -4,8 +4,20 @@
 -- Index Strategy:
 -- 1. B-tree indexes on high-cardinality filter columns (status, type, time)
 -- 2. GIN index on JSONB for flexible metadata queries
--- 3. Composite indexes for common join patterns
--- 4. No redundant indexes (each serves a distinct query pattern)
+-- 3. Composite indexes for common query patterns
+-- 4. No redundant indexes - see the rule below, which this file now follows
+--
+-- THE LEFTMOST-PREFIX RULE
+-- A B-tree index on (a, b) already answers every query a lone index on (a)
+-- could: Postgres scans the leading column and ignores the rest. So a
+-- single-column index whose column is the first column of an existing
+-- composite index is dead weight - it is never the better plan, yet it still
+-- has to be written on every INSERT/UPDATE and vacuumed on every cleanup.
+-- The reverse is NOT true: (a, b) cannot serve a query filtering on b alone.
+--
+-- This header used to claim "no redundant indexes" while the file created
+-- three. They are documented at the bottom rather than silently dropped, so
+-- the next person does not re-add them.
 --
 -- Run: psql -U postgres -d golden_dragon_prague -f sql/02_indexes.sql
 -- ============================================================
@@ -13,14 +25,14 @@
 -- ============================================================
 -- Orders table indexes
 -- ============================================================
--- Most common filter: orders by date range (daily reports, trends)
-CREATE INDEX idx_orders_time ON Orders(order_time);
+-- order_time and order_type are NOT indexed on their own here: they are the
+-- leading columns of idx_orders_date_status and idx_orders_type_status below,
+-- which cover the single-column cases for free.
 
--- Status filtering: kitchen queue, daily revenue, pending orders
+-- Status filtering: kitchen queue, daily revenue, pending orders.
+-- Needed standalone - status is the SECOND column of both composites, so
+-- neither can serve `WHERE status = 'completed'` on its own.
 CREATE INDEX idx_orders_status ON Orders(status);
-
--- Order type filtering: delivery vs dine-in analytics
-CREATE INDEX idx_orders_type ON Orders(order_type);
 
 -- Source attribution: Wolt/Bolt vs walk-in revenue comparison
 CREATE INDEX idx_orders_source ON Orders(source);
@@ -72,18 +84,48 @@ CREATE INDEX idx_menus_category ON Menus(category_id);
 -- Availability filter: seasonal menu changes
 CREATE INDEX idx_menus_available ON Menus(is_available);
 
--- Stock level queries: low stock alerts, inventory management
-CREATE INDEX idx_inventory_menu ON Inventory(menu_id);
+-- Inventory.menu_id is declared UNIQUE in 01_schema.sql, and Postgres backs
+-- every UNIQUE constraint with a B-tree index automatically. An explicit
+-- index on the same column is a byte-for-byte duplicate.
+
+-- ============================================================
+-- Payments indexes
+-- ============================================================
+-- Payments.order_id is a foreign key with no index. v_order_summary looks up
+-- payments per order in a LATERAL subquery, and the accounting queries in
+-- 08_queries.sql join the same way, so every one of them was doing a
+-- sequential scan of Payments per order.
+CREATE INDEX idx_payments_order ON Payments(order_id);
 
 -- ============================================================
 -- Composite indexes for common query patterns
 -- ============================================================
--- Revenue by date + status (daily sales reports)
+-- Revenue by date + status (daily sales reports).
+-- Also covers plain `WHERE order_time BETWEEN ...` via its leading column.
 CREATE INDEX idx_orders_date_status ON Orders(order_time, status);
 
--- Completed delivery orders for source performance analysis
+-- Delivery vs dine-in performance, filtered to completed orders.
+-- Also covers plain `WHERE order_type = 'delivery'` via its leading column.
 CREATE INDEX idx_orders_type_status ON Orders(order_type, status);
 
+-- ============================================================
+-- Deliberately NOT created (redundant - do not re-add)
+-- ============================================================
+-- idx_orders_time    ON Orders(order_time)  -> prefix of idx_orders_date_status
+-- idx_orders_type    ON Orders(order_type)  -> prefix of idx_orders_type_status
+-- idx_inventory_menu ON Inventory(menu_id)  -> duplicate of the UNIQUE constraint
+--
+-- To confirm nothing redundant has crept back in, this finds single-column
+-- indexes whose column already leads another index on the same table:
+--
+--   SELECT a.indexrelid::regclass AS redundant, b.indexrelid::regclass AS covered_by
+--   FROM pg_index a JOIN pg_index b
+--     ON a.indrelid = b.indrelid AND a.indexrelid <> b.indexrelid
+--   WHERE a.indnatts = 1
+--     AND a.indkey[0] = b.indkey[0]
+--     AND b.indnatts >= a.indnatts
+--     AND NOT a.indisunique;
+--
 -- ============================================================
 -- Index usage verification
 -- ============================================================
@@ -96,5 +138,13 @@ CREATE INDEX idx_orders_type_status ON Orders(order_type, status);
 -- Should show: Bitmap Heap Scan with GIN index
 --
 -- EXPLAIN ANALYZE SELECT * FROM Orders WHERE order_time BETWEEN '2025-01-01' AND '2025-12-31';
--- Should show: Index Scan using idx_orders_time
+-- Should show: Index Scan using idx_orders_date_status  (leading column)
+--
+-- EXPLAIN ANALYZE SELECT SUM(amount) FROM Payments WHERE order_id = 14;
+-- Should show: Index Scan using idx_payments_order
+--
+-- NOTE: on a 15-order seed database Postgres will pick a sequential scan for
+-- most of these regardless - the whole table fits in one page, so a scan is
+-- genuinely cheaper. Force the comparison with SET enable_seqscan = off, or
+-- check the plans against a realistically sized copy.
 -- ============================================================

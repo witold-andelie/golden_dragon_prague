@@ -119,21 +119,44 @@ COMMENT ON FUNCTION trg_after_order_detail() IS 'AFTER INSERT trigger: updates I
 --
 -- Business Rules:
 -- - "out_for_delivery" only valid for delivery orders
--- - Completed orders earn loyalty points (1 per 50 CZK)
+-- - Completed orders earn loyalty points (1 per FULL 50 CZK spent)
+-- - Leaving 'completed' (cancellation, refund) takes those points back
 -- ============================================================
 CREATE OR REPLACE FUNCTION trg_order_status_change()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_points INT;
 BEGIN
     -- Validation: out_for_delivery only for delivery orders
     IF NEW.status = 'out_for_delivery' AND NEW.order_type != 'delivery' THEN
         RAISE EXCEPTION 'Status "out_for_delivery" is only valid for delivery orders (current type: %)', NEW.order_type;
     END IF;
 
-    -- Loyalty points: award when order transitions to completed
-    IF NEW.status = 'completed' AND OLD.status != 'completed' THEN
-        UPDATE Users
-        SET loyalty_points = loyalty_points + GREATEST(1, (NEW.total / 50)::INT)
-        WHERE user_id = NEW.user_id;
+    IF NEW.user_id IS NULL THEN
+        RETURN NEW;   -- walk-in / phone order with no account to credit
+    END IF;
+
+    -- Loyalty points: award when order transitions to completed.
+    -- FLOOR, not a cast: "1 point per 50 CZK spent" means full 50 CZK blocks.
+    -- NUMERIC::INT rounds half-up, so a 275 CZK order used to earn 6 points for
+    -- 5.5 blocks; and GREATEST(1, ...) handed a free point to 0 CZK orders.
+    IF NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed' THEN
+        v_points := FLOOR(COALESCE(NEW.total, 0) / 50)::INT;
+        IF v_points > 0 THEN
+            UPDATE Users
+            SET loyalty_points = loyalty_points + v_points
+            WHERE user_id = NEW.user_id;
+        END IF;
+
+    -- Reversal: an order that leaves 'completed' (cancelled, refunded) must not
+    -- leave the points it earned behind.
+    ELSIF OLD.status = 'completed' AND NEW.status IS DISTINCT FROM 'completed' THEN
+        v_points := FLOOR(COALESCE(OLD.total, 0) / 50)::INT;
+        IF v_points > 0 THEN
+            UPDATE Users
+            SET loyalty_points = GREATEST(0, loyalty_points - v_points)
+            WHERE user_id = NEW.user_id;
+        END IF;
     END IF;
 
     RETURN NEW;
@@ -232,6 +255,47 @@ COMMENT ON TRIGGER trg_order_audit_log ON Orders IS 'AFTER UPDATE: logs status c
 COMMENT ON FUNCTION trg_order_audit() IS 'Audit trail trigger: records who changed order status and when.';
 
 -- ============================================================
+-- TRIGGER 7: Inventory Restock on Cancellation (AFTER UPDATE)
+-- Returns the reserved stock when an order is cancelled
+--
+-- Business Rule: stock is deducted the moment a line item is added
+-- (trg_orderdetail_after). Without the mirror-image operation here, every
+-- cancellation permanently destroyed inventory: the dishes were never cooked
+-- but the stock never came back, so low-stock alerts and reorder planning
+-- drifted further from reality with every cancelled order.
+-- ============================================================
+CREATE OR REPLACE FUNCTION trg_restock_on_cancel()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Aggregate first: an order may list the same dish on several lines, and
+    -- an UPDATE ... FROM would otherwise apply only one of the matching rows.
+    UPDATE Inventory i
+    SET quantity     = i.quantity + agg.qty,
+        last_updated = NOW()
+    FROM (
+        SELECT menu_id, SUM(quantity) AS qty
+        FROM OrderDetails
+        WHERE order_id = NEW.order_id
+        GROUP BY menu_id
+    ) agg
+    WHERE i.menu_id = agg.menu_id;
+
+    RETURN NULL;  -- AFTER trigger: return value is ignored
+END;
+$$ LANGUAGE plpgsql;
+
+-- The WHEN clause makes this fire only on the TRANSITION into 'cancelled', so
+-- re-saving an already-cancelled order can never restock the same items twice.
+CREATE TRIGGER trg_order_cancel_restock
+AFTER UPDATE OF status ON Orders
+FOR EACH ROW
+WHEN (NEW.status = 'cancelled' AND OLD.status IS DISTINCT FROM 'cancelled')
+EXECUTE FUNCTION trg_restock_on_cancel();
+
+COMMENT ON TRIGGER trg_order_cancel_restock ON Orders IS 'AFTER status UPDATE to cancelled: returns the order''s quantities to Inventory. Fires only on the transition, so it cannot double-restock.';
+COMMENT ON FUNCTION trg_restock_on_cancel() IS 'Reverses the inventory deduction made by trg_after_order_detail() when an order is cancelled.';
+
+-- ============================================================
 -- TRIGGER SUMMARY
 -- ============================================================
 -- Trigger Name              | Table         | Timing    | Event          | Purpose
@@ -242,6 +306,7 @@ COMMENT ON FUNCTION trg_order_audit() IS 'Audit trail trigger: records who chang
 -- trg_order_status          | Orders        | AFTER     | UPDATE(status)  | Status validation + loyalty
 -- trg_reservation_check     | Reservations  | BEFORE    | INSERT/UPDATE   | Conflict prevention
 -- trg_order_audit_log       | Orders        | AFTER     | UPDATE(status)  | Audit trail
+-- trg_order_cancel_restock  | Orders        | AFTER     | UPDATE(status)  | Inventory restock on cancel
 --
 -- Trigger Execution Order:
 -- 1. BEFORE: trg_check_inventory (validate stock)

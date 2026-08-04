@@ -131,10 +131,26 @@ get_daily_summary() ──► Operational dashboard
 
 | Index | Type | Purpose | Query Pattern |
 |-------|------|---------|---------------|
-| `idx_orders_time` | B-tree | Date range queries | Daily reports, trends |
 | `idx_orders_status` | B-tree | Status filtering | Kitchen queue, pending orders |
 | `idx_special_requests_gin` | GIN | JSONB search | Dietary restrictions |
-| `idx_orders_date_status` | Composite | Revenue reports | WHERE time=X AND status=Y |
+| `idx_payments_order` | B-tree | Payment lookup per order | `v_order_summary`, accounting joins |
+| `idx_orders_date_status` | Composite | Revenue reports, date ranges | `WHERE time=X AND status=Y`, and `time` alone |
+| `idx_orders_type_status` | Composite | Channel performance | `WHERE type=X AND status=Y`, and `type` alone |
+
+### Leftmost-Prefix Rule
+
+A B-tree index on `(a, b)` already serves every query an index on `(a)` alone
+could — Postgres scans the leading column and ignores the rest. A single-column
+index on the leading column of an existing composite is therefore never the
+better plan, but still costs a write on every `INSERT`/`UPDATE`.
+
+`idx_orders_time` and `idx_orders_type` were exactly that, and
+`idx_inventory_menu` duplicated the index Postgres creates automatically for
+`Inventory.menu_id UNIQUE`. All three are gone; `sql/02_indexes.sql` lists them
+with a detection query so they do not come back.
+
+The rule does not run in reverse: `(order_time, status)` cannot serve a filter
+on `status` alone, which is why `idx_orders_status` stays.
 
 ### GIN Index on JSONB
 

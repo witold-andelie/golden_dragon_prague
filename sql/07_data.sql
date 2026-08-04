@@ -161,9 +161,18 @@ INSERT INTO Reservations (user_id, table_id, reservation_time, party_size, notes
 -- Timestamps spread across past months for realistic analysis
 -- ============================================================
 
--- Order 1: Dine-in, completed, weekday lunch (triggered lunch pricing)
+-- Order 1: Dine-in, completed, weekday lunch (triggers lunch pricing)
+--
+-- Monday. This used to be dated 2025-06-15, which is a SUNDAY - so the comment
+-- claimed lunch pricing that the trigger never applied. It was not alone: NOT
+-- ONE of the fifteen seed orders fell inside Mon-Fri 11:00-14:30, so
+-- price_lunch, get_effective_price(), is_lunch_window(),
+-- v_lunch_vs_dinner_analysis and fact_orders.is_lunch_order were all dead
+-- weight against this data - the lunch analysis view returned a single
+-- 'Regular Pricing' row and looked perfectly healthy while doing it.
+-- Orders 1, 9, 11 and 15 now land in the window; 4 sits just past it.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (1, 2, 3, 'dine_in', 'completed', 'walk-in', '2025-06-15 12:30:00',
+VALUES (1, 2, 3, 'dine_in', 'completed', 'walk-in', '2025-06-16 12:30:00',
         '{"spicy": "less spicy", "notes": "Small portion for child", "allergies": ["peanuts"]}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (1, 1, 2), (1, 6, 1);
@@ -179,16 +188,27 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (2, 7, 2), (2, 14,
 -- Order 3: Private event, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
 VALUES (3, 1, 'event', 'completed', 'phone', '2025-06-20 18:30:00',
-        '{"event": "30th birthday party", "guests": 12, "notes": "Private room VIP1, vegetarian options needed"}');
+        -- The 'diet' key is what Query 7 in 09_analytics_queries.sql and the GIN
+        -- example in docs/ARCHITECTURE.md both search for. No seed order carried
+        -- one, so both demonstrated the feature by returning nothing. The notes
+        -- here already said vegetarian; this states it in the field meant to
+        -- hold it.
+        '{"event": "30th birthday party", "guests": 12, "diet": "vegetarian", "notes": "Private room VIP1, vegetarian options needed"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (3, 8, 1), (3, 6, 3), (3, 9, 2);
 
 INSERT INTO Events (order_id, event_date, location, expected_guests)
 VALUES (3, '2025-06-20 18:30:00', 'Golden Dragon - VIP1 private room', 12);
 
--- Order 4: Dine-in, completed
+-- Order 4: Dine-in, completed - REGRESSION WITNESS for the lunch cut-off
+--
+-- Monday 14:45: a weekday, after 14:30, so this is REGULAR pricing. The old
+-- rule `EXTRACT(HOUR ...) BETWEEN 11 AND 14` accepted everything up to 14:59
+-- and would have charged this order lunch prices. Keeping one seed order in
+-- the 14:30-14:59 gap means that bug can never come back unnoticed: it would
+-- change this order's subtotal from 283.00 to 243.00 the moment it did.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (4, 3, 1, 'dine_in', 'completed', 'phone', '2025-06-22 13:00:00', '{"notes": "Window seat please"}');
+VALUES (4, 3, 1, 'dine_in', 'completed', 'phone', '2025-06-23 14:45:00', '{"notes": "Window seat please"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (4, 10, 1), (4, 15, 2);
 
@@ -221,15 +241,17 @@ VALUES (7, 5, 'delivery', 'completed', 'wolt', '2025-07-12 18:45:00',
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (8, 9, 1), (8, 14, 1);
 
--- Order 9: Dine-in, preparing (active order)
+-- Order 9: Dine-in, preparing (active order), weekday lunch
+-- The 9/10/11 "currently active" cluster moves from Sunday 2025-08-03 to
+-- Monday 2025-08-04 so that a "Business lunch" is actually served at lunch.
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (1, 2, 6, 'dine_in', 'preparing', 'walk-in', '2025-08-03 12:00:00', '{"notes": "Business lunch"}');
+VALUES (1, 2, 6, 'dine_in', 'preparing', 'walk-in', '2025-08-04 12:00:00', '{"notes": "Business lunch"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (9, 13, 2), (9, 5, 2);
 
 -- Order 10: Delivery, out_for_delivery (active order)
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, delivery_address, special_requests)
-VALUES (8, 5, 'delivery', 'out_for_delivery', 'bolt', '2025-08-03 12:15:00',
+VALUES (8, 5, 'delivery', 'out_for_delivery', 'bolt', '2025-08-04 12:15:00',
         '{"street": "Ostrovni 22", "city": "Prague 1", "postal": "11000", "note": "Leave at door"}',
         '{"notes": "Extra sauce"}');
 
@@ -237,7 +259,7 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (10, 3, 1), (10, 1
 
 -- Order 11: Dine-in, new (just placed)
 INSERT INTO Orders (user_id, employee_id, table_id, order_type, status, source, order_time, special_requests)
-VALUES (4, 6, 5, 'dine_in', 'new', 'walk-in', '2025-08-03 12:30:00', '{"notes": "Celebrating promotion"}');
+VALUES (4, 6, 5, 'dine_in', 'new', 'walk-in', '2025-08-04 12:30:00', '{"notes": "Celebrating promotion"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (11, 11, 1);
 
@@ -264,24 +286,11 @@ INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (14, 6, 2), (14, 7
 
 -- Order 15: Takeaway, completed
 INSERT INTO Orders (user_id, employee_id, order_type, status, source, order_time, special_requests)
-VALUES (5, 4, 'takeaway', 'completed', 'website', '2025-07-20 11:45:00', '{"notes": "Lunch special"}');
+-- Monday. Was 2025-07-20, a Sunday, despite ordering a Lunch Set off the
+-- lunch menu and saying so in its own notes.
+VALUES (5, 4, 'takeaway', 'completed', 'website', '2025-07-21 11:45:00', '{"notes": "Lunch special"}');
 
 INSERT INTO OrderDetails (order_id, menu_id, quantity) VALUES (15, 12, 1);
-
--- ============================================================
--- PAYMENTS
--- ============================================================
-INSERT INTO Payments (order_id, method, amount, paid_at) VALUES
-(2,  'online',  357.00,  '2025-06-18 19:20:00'),
-(4,  'card',    185.00,  '2025-06-22 13:10:00'),
-(5,  'qr',      388.00,  '2025-07-02 20:05:00'),
-(6,  'cash',    287.00,  '2025-07-05 12:25:00'),
-(7,  'card',    1245.00, '2025-07-10 20:00:00'),
-(8,  'online',  218.00,  '2025-07-12 18:50:00'),
-(9,  'card',    399.00,  '2025-08-03 12:10:00'),
-(10, 'online',  253.00,  '2025-08-03 12:20:00'),
-(14, 'online',  1245.00, '2025-07-15 19:10:00'),
-(15, 'card',    139.00,  '2025-07-20 11:50:00');
 
 -- ============================================================
 -- FINALIZE ALL ORDERS
@@ -304,14 +313,72 @@ SELECT finalize_order(14);
 SELECT finalize_order(15);
 
 -- ============================================================
+-- PAYMENTS
+--
+-- Must come AFTER finalize_order: what a guest pays is the VAT-inclusive
+-- Orders.total, and that number does not exist until the order is finalized.
+--
+-- The amounts are DERIVED from that total, never typed in. They used to be
+-- hand-written VAT-exclusive figures that had drifted from the totals the
+-- triggers compute - order 4 was recorded as 185.00 against a real 316.96,
+-- order 14 as 1245.00 against 1491.84 - so nine of the ten payments were
+-- silently short. v_order_summary reported them all as PAID only because its
+-- own payment logic was broken too; with that fixed they showed up as PARTIAL,
+-- which is what a books-don't-balance state should look like.
+--
+-- Deriving the amount means a menu price change, a VAT rate change or a new
+-- line item can never desynchronise the seed data again: the payment follows
+-- whatever the order actually came to.
+--
+-- Orders 1, 3, 11, 12 and 13 deliberately have no payment row, so the UNPAID
+-- and PARTIAL branches of v_order_summary stay exercised by the seed data:
+--   1, 3  - completed, invoiced on account (settled outside this system)
+--   11    - dine-in still open, guest has not asked for the bill
+--   12    - event confirmed for a future date, deposit not yet taken
+--   13    - cancelled before service, nothing to collect
+-- Order 9 pays a 200 CZK deposit on an order still being prepared, which is
+-- the one genuine PARTIAL in the data.
+-- ============================================================
+INSERT INTO Payments (order_id, method, amount, paid_at)
+SELECT v.order_id, v.method, o.total, v.paid_at
+FROM (VALUES
+    (2,  'online', TIMESTAMP '2025-06-18 19:20:00'),
+    (4,  'card',   TIMESTAMP '2025-06-23 14:55:00'),
+    (5,  'qr',     TIMESTAMP '2025-07-02 20:05:00'),
+    (6,  'cash',   TIMESTAMP '2025-07-05 12:25:00'),
+    (7,  'card',   TIMESTAMP '2025-07-10 20:00:00'),
+    (8,  'online', TIMESTAMP '2025-07-12 18:50:00'),
+    (10, 'online', TIMESTAMP '2025-08-04 12:20:00'),
+    (14, 'online', TIMESTAMP '2025-07-15 19:10:00'),
+    (15, 'card',   TIMESTAMP '2025-07-21 11:50:00')
+) AS v(order_id, method, paid_at)
+JOIN Orders o ON o.order_id = v.order_id;
+
+-- The one intentional partial payment: a deposit on an in-progress order.
+INSERT INTO Payments (order_id, method, amount, paid_at, reference)
+VALUES (9, 'card', 200.00, '2025-08-04 12:10:00', 'Deposit - balance due on collection');
+
+-- ============================================================
 -- DATA SUMMARY
 -- ============================================================
+-- Counts below are by Orders.status and must sum to "Orders placed".
+-- They previously claimed 11 completed orders against 10 in the data, and
+-- omitted the confirmed one entirely, so the totals did not add up - which
+-- makes the block useless as the sanity check it is meant to be.
+--
 -- Orders placed:           15
--- Completed:               11
--- Active (new/preparing):  2
--- Out for delivery:        1
--- Cancelled:               1
--- Events:                  1
--- Reservations:            6
--- Payments:                10
+--   completed:             10   (1-8, 14, 15)
+--   confirmed:              1   (12 - future event)
+--   preparing:              1   (9)
+--   new:                    1   (11)
+--   out_for_delivery:       1   (10)
+--   cancelled:              1   (13)
+--
+-- Orders with order_type = 'event':  2   (3 completed, 12 upcoming)
+-- Rows in Events:                    1   (only order 3 has been scheduled)
+-- Reservations:                      6   (3 completed, 2 confirmed, 1 pending)
+-- Payments:                         10   (9 paid in full, 1 deposit on order 9)
+--   fully paid:                      9
+--   partial:                         1   (9)
+--   unpaid:                          5   (1, 3, 11, 12, 13)
 -- ============================================================

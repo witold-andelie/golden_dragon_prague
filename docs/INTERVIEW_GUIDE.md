@@ -197,8 +197,8 @@ SUM(revenue) OVER (ORDER BY revenue DESC ROWS UNBOUNDED PRECEDING) AS cumulative
 | Metric | Value | Why It Matters |
 |--------|-------|---------------|
 | Tables | 13 | Full data model coverage |
-| Functions | 8 | Business logic in database |
-| Triggers | 6 | Automated data integrity |
+| Functions | 10 | Business logic in database |
+| Triggers | 7 | Automated data integrity |
 | Views | 19 | Operational + BI coverage |
 | Indexes | 14+ | Query optimization |
 | ETL Procedures | 3 | Data pipeline automation |

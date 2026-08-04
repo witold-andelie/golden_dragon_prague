@@ -210,8 +210,16 @@ COMMENT ON VIEW v_hourly_demand_patterns IS 'Hourly demand by day of week. Used 
 -- Revenue attribution by channel (Wolt vs Bolt vs walk-in)
 --
 -- Business Use: Channel profitability analysis, marketing budget allocation
+--
+-- The commission is per CHANNEL, not a flat 22% on everything. The previous
+-- version charged 22% to walk-in and phone orders too, which invented a fee the
+-- restaurant never pays and made its own dine-in business look 22% less
+-- profitable than delivery in the exact comparison this view exists to support.
+-- Rates come from get_platform_commission_rate().
 -- ============================================================
-CREATE OR REPLACE VIEW v_source_performance AS
+DROP VIEW IF EXISTS v_source_performance;
+
+CREATE VIEW v_source_performance AS
 SELECT
     source,
     order_type,
@@ -219,16 +227,16 @@ SELECT
     SUM(total) AS gross_revenue,
     SUM(delivery_fee) AS delivery_fees_earned,
     SUM(vat_amount) AS vat_collected,
-    AVG(total) AS avg_order_value,
-    -- Delivery cost estimate: platform takes ~20-25%
-    ROUND(SUM(total) * 0.22, 2) AS estimated_platform_fees,
-    ROUND(SUM(total) * 0.78, 2) AS estimated_net_revenue
+    ROUND(AVG(total), 2) AS avg_order_value,
+    get_platform_commission_rate(source) AS platform_commission_rate,
+    ROUND(SUM(total) * get_platform_commission_rate(source), 2) AS estimated_platform_fees,
+    ROUND(SUM(total) * (1 - get_platform_commission_rate(source)), 2) AS estimated_net_revenue
 FROM Orders
 WHERE status = 'completed'
 GROUP BY source, order_type
 ORDER BY gross_revenue DESC;
 
-COMMENT ON VIEW v_source_performance IS 'Channel profitability analysis. Estimates platform fees (Wolt/Bolt ~22%). Shows which channels drive most net revenue.';
+COMMENT ON VIEW v_source_performance IS 'Channel profitability analysis. Platform commission is applied per channel via get_platform_commission_rate() (Wolt/Bolt 22%, Uber Eats 25%, direct channels 0%). Shows which channels drive most net revenue.';
 
 -- ============================================================
 -- ANALYTICS VIEW 6: v_lunch_vs_dinner_analysis
@@ -236,26 +244,43 @@ COMMENT ON VIEW v_source_performance IS 'Channel profitability analysis. Estimat
 --
 -- Business Use: Evaluate lunch special pricing strategy
 -- ============================================================
+-- Bucketing uses is_lunch_window() so this view and the pricing that produced
+-- the rows it measures agree on where lunch ends. Re-deriving the window here
+-- as `HOUR BETWEEN 11 AND 14` counted 14:30-14:59 orders - charged at regular
+-- prices - as lunch, which dragged the "Lunch Special" average price upward and
+-- understated the discount the strategy actually costs.
+--
+-- Aggregation is done at ORDER grain first: the join to OrderDetails fans an
+-- order out to one row per line, so COUNT(*) counted line items, not orders,
+-- and AVG(o.total) weighted every order by how many lines it happened to have.
 CREATE OR REPLACE VIEW v_lunch_vs_dinner_analysis AS
+WITH order_grain AS (
+    SELECT
+        o.order_id,
+        CASE WHEN is_lunch_window(o.order_time)
+             THEN 'Lunch Special' ELSE 'Regular Pricing' END AS pricing_period,
+        o.total                          AS order_total,
+        SUM(od.quantity)                 AS portions,
+        SUM(od.quantity * od.unit_price) AS line_revenue
+    FROM Orders o
+    JOIN OrderDetails od ON o.order_id = od.order_id
+    WHERE o.status = 'completed'
+    GROUP BY o.order_id, o.order_time, o.total
+)
 SELECT
-    CASE
-        WHEN EXTRACT(HOUR FROM order_time) BETWEEN 11 AND 14
-             AND EXTRACT(ISODOW FROM order_time) BETWEEN 1 AND 5
-        THEN 'Lunch Special'
-        ELSE 'Regular Pricing'
-    END AS pricing_period,
-    COUNT(*) AS orders,
-    SUM(od.quantity) AS portions,
-    SUM(od.quantity * od.unit_price) AS revenue,
-    ROUND(AVG(od.unit_price), 2) AS avg_item_price,
-    ROUND(AVG(o.total), 2) AS avg_order_total
-FROM Orders o
-JOIN OrderDetails od ON o.order_id = od.order_id
-WHERE o.status = 'completed'
+    pricing_period,
+    COUNT(*)                                                AS orders,
+    SUM(portions)                                           AS portions,
+    SUM(line_revenue)                                       AS revenue,
+    -- Portion-weighted, so a 5-portion side dish does not count the same as a
+    -- single duck when describing "the average item price in this window".
+    ROUND(SUM(line_revenue) / NULLIF(SUM(portions), 0), 2)  AS avg_item_price,
+    ROUND(AVG(order_total), 2)                              AS avg_order_total
+FROM order_grain
 GROUP BY pricing_period
 ORDER BY revenue DESC;
 
-COMMENT ON VIEW v_lunch_vs_dinner_analysis IS 'Compares lunch special pricing vs regular pricing. Shows revenue impact of discounted lunch hours.';
+COMMENT ON VIEW v_lunch_vs_dinner_analysis IS 'Compares lunch special pricing vs regular pricing, bucketed by is_lunch_window(). Aggregated at order grain so counts and averages are per order, not per line item.';
 
 -- ============================================================
 -- ANALYTICS VIEW 7: v_kitchen_efficiency
